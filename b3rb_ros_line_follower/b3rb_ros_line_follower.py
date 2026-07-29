@@ -51,8 +51,9 @@ AVOIDANCE_THRESHOLD = 0.8   # metres — start avoidance
 
 # ── Target approach ───────────────────────────────────────────────────────────
 # Applied only when the target location sign has been seen (near destination).
-APPROACH_CREEP_THRESHOLD = 0.30   # was 0.45 — tighter creep zone
-APPROACH_STOP_THRESHOLD  = 0.12   # was 0.22 — stop closer to QR
+# LIDAR uses median of front cluster (not min) to avoid corner-point false stops.
+APPROACH_CREEP_THRESHOLD = 0.55   # metres — start slowing
+APPROACH_STOP_THRESHOLD  = 0.30   # metres — stop for QR scan (median distance)
 
 # ── Directional sign: how many consecutive frames of bias drop = turn done ───
 # Once the bias drops (both vectors straddle) for this many frames, the
@@ -60,15 +61,18 @@ APPROACH_STOP_THRESHOLD  = 0.12   # was 0.22 — stop closer to QR
 TURN_DONE_FRAMES = 5
 
 # ── PID gains ───────────────────────────────────────────────────────────────
-KP = 0.40   # was 0.25 — stronger proportional correction at higher speed
+KP = 0.55   # strong proportional — fast correction at high speed
 KI = 0.0
-KD = 0.14   # was 0.08 — more damping to prevent oscillation / overshoot
+KD = 0.18   # strong derivative — damps overshoot
 
 # ── Boundary proximity steering ──────────────────────────────────────────────
-BOUNDARY_ZONE = 0.55   # was 0.35 — start correcting earlier, further from edge
+BOUNDARY_ZONE = 0.45   # PID active in outer 45% of lane — earlier than default
 
 # ── Speed control ────────────────────────────────────────────────────────────
-SPEED_REDUCTION_THRESHOLD = 0.15   # was 0.3 — cut speed sooner when turning
+SPEED_REDUCTION_THRESHOLD = 0.15   # cut speed sooner when turning
+
+# ── Integral windup clamp ────────────────────────────────────────────────────
+INTEGRAL_CLAMP = 0.3   # prevent integral term accumulating through long curves
 
 
 # ── FSM States ───────────────────────────────────────────────────────────────
@@ -191,6 +195,11 @@ class LineFollower(Node):
         # Enables the creep-and-stop approach logic in lidar_callback.
         self.target_sign_seen = False
 
+        # ── QR pending payload ─────────────────────────────────────────────
+        # Set by qr_detection_callback once a matching QR is seen.
+        # Cleared after the server handshake is triggered.
+        self._qr_pending_payload = None
+
         # ── Throttle counters ──────────────────────────────────────────────
         self._pid_log_counter = 0
 
@@ -264,6 +273,7 @@ class LineFollower(Node):
         self._turn_done_count    = 0
         self.avoiding            = False
         self.target_sign_seen    = False
+        self._qr_pending_payload = None
         self.get_logger().info(
             f"[MISSION] {old} → {new_target} (look for sign '{sign}' / QR '{new_target}')"
         )
@@ -350,23 +360,23 @@ class LineFollower(Node):
     # ================================================================== #
 
     def qr_detection_callback(self, message):
-        """Stop and handshake when QR matching active_target is scanned."""
+        """
+        When QR matching active_target is scanned:
+          - Record the payload so we can send it once fully stopped.
+          - Do NOT send to server yet — lidar_callback will confirm the
+            buggy is stopped at the building and then trigger the handshake.
+        """
         if self.current_state in (State.SERVER_HANDSHAKE, State.MISSION_COMPLETE):
             return
 
         payload = message.data
         if self.active_target in payload:
-            self.get_logger().info(
-                f"[QR] MATCH '{self.active_target}' in '{payload}' — stopping."
-            )
-            self.target_speed = 0.0
-            self.target_turn  = 0.0
-            self.avoiding     = False
-            self._transition(
-                State.SERVER_HANDSHAKE,
-                f"QR matched '{self.active_target}'."
-            )
-            self.send_server_message(payload)
+            if self._qr_pending_payload is None:
+                self.get_logger().info(
+                    f"[QR] MATCH '{self.active_target}' in '{payload}' — "
+                    "flagged, waiting to confirm stop before server handshake."
+                )
+            self._qr_pending_payload = payload
 
     # ================================================================== #
     #  Callback: Edge Vectors → PID steering                             #
@@ -486,6 +496,7 @@ class LineFollower(Node):
             error += bias
 
         self.integral  += error
+        self.integral   = max(-INTEGRAL_CLAMP, min(INTEGRAL_CLAMP, self.integral))
         derivative      = error - self.prev_error
         u               = self.kp * error + self.ki * self.integral + self.kd * derivative
         self.prev_error = error
@@ -515,33 +526,68 @@ class LineFollower(Node):
         """
         LIDAR — only active in TRACKING.
 
-        <= APPROACH_STOP_THRESHOLD  : stop (QR scan range).
-        <= APPROACH_CREEP_THRESHOLD : slow to 0.1 m/s.
-        <  AVOIDANCE_THRESHOLD      : set avoiding=True, pick clearer side.
-        >= AVOIDANCE_THRESHOLD      : clear avoiding flag if set.
+        Uses the MEDIAN of front-sector readings instead of min() so that
+        a large building cluster is measured at its face, not at a protruding
+        corner point that would stop the buggy too early.
+
+        Approach sequence (only when target_sign_seen is True):
+          median <= APPROACH_STOP_THRESHOLD  : stop, then trigger SERVER_HANDSHAKE
+                                               if a QR has already been scanned.
+          median <= APPROACH_CREEP_THRESHOLD : slow to creep speed.
+
+        Once fully stopped AND _qr_pending_payload is set:
+          → transition to SERVER_HANDSHAKE and send QR payload to server.
+
+        Obstacle avoidance (when target_sign_seen is False):
+          < AVOIDANCE_THRESHOLD : steer around obstacle.
+          >= AVOIDANCE_THRESHOLD: cancel avoidance.
         """
         if self.current_state != State.TRACKING:
             return
 
-        N            = len(message.ranges)
-        front_start  = int(N * 7 / 18)
-        front_end    = int(N * 11 / 18)
-        finite_front = [r for r in message.ranges[front_start:front_end]
-                        if math.isfinite(r)]
-        min_dist     = min(finite_front) if finite_front else math.inf
+        N           = len(message.ranges)
+        front_start = int(N * 7 / 18)
+        front_end   = int(N * 11 / 18)
+        front_vals  = [r for r in message.ranges[front_start:front_end]
+                       if math.isfinite(r)]
 
-        if min_dist <= APPROACH_STOP_THRESHOLD and self.target_sign_seen:
-            if self.target_speed > 0.0:
-                self.target_speed = 0.0
-                self.target_turn  = 0.0
-                self.get_logger().info(
-                    f"[APPROACH] Stopped at {min_dist:.2f} m — waiting for QR scan."
-                )
-            return
+        if not front_vals:
+            med_dist = math.inf
+        else:
+            front_vals.sort()
+            med_dist = front_vals[len(front_vals) // 2]
 
-        if min_dist <= APPROACH_CREEP_THRESHOLD and self.target_sign_seen:
-            self.target_speed = min(self.target_speed, 0.23)  # was 0.15 → +50%
-            return
+        # ── Approach mode (target sign was seen) ─────────────────────────
+        if self.target_sign_seen:
+            if med_dist <= APPROACH_STOP_THRESHOLD:
+                if self.target_speed > 0.0:
+                    self.target_speed = 0.0
+                    self.target_turn  = 0.0
+                    self.avoiding     = False
+                    self.get_logger().info(
+                        f"[APPROACH] Stopped at {med_dist:.2f} m (median) beside building."
+                    )
+
+                # Confirm stopped, then do server handshake if QR was seen.
+                if self._qr_pending_payload is not None and self.target_speed == 0.0:
+                    payload = self._qr_pending_payload
+                    self._qr_pending_payload = None
+                    self.get_logger().info(
+                        f"[QR] Confirmed stopped — sending '{payload}' to server."
+                    )
+                    self._transition(
+                        State.SERVER_HANDSHAKE,
+                        f"QR matched '{self.active_target}', confirmed stopped."
+                    )
+                    self.send_server_message(payload)
+                return
+
+            if med_dist <= APPROACH_CREEP_THRESHOLD:
+                self.target_speed = min(self.target_speed, 0.23)
+                return
+
+        # ── Obstacle avoidance ────────────────────────────────────────────
+        min_dist = min(front_vals) if front_vals else math.inf
 
         if min_dist < AVOIDANCE_THRESHOLD:
             if not self.avoiding:
@@ -564,7 +610,6 @@ class LineFollower(Node):
                 self.target_speed = AVOIDANCE_SPEED
                 self.target_turn  = self.avoidance_turn_value
         else:
-            # Path clear — cancel avoidance.
             if self.avoiding:
                 self.avoiding = False
                 self.get_logger().info("[AVOID] Path clear — avoidance cancelled.")

@@ -38,9 +38,17 @@ TURN_MIN   = -1.0
 TURN_BIAS_LEFT     =  0.4   # added to normalised error (pushes PID left)
 TURN_BIAS_RIGHT    = -0.4   # added to normalised error (pushes PID right)
 
+# ── Boundary constraint ──────────────────────────────────────────────────────
+# When only one edge vector is visible the buggy is near that boundary.
+# A correction turn is applied to steer away from it.
+# Value is the normalised turn magnitude (0–1) applied toward the open side.
+BOUNDARY_CORRECTION_TURN = 0.5
+# Speed cap when running on a single boundary vector (slow down, recover).
+BOUNDARY_SPEED_CAP       = 0.2
+
 # ── Speed while navigating a ZONE_APPROACH ──────────────────────────────────
 ZONE_SPEED_FRACTION = 0.4   # fraction of SPEED_MAX used in ZONE_APPROACH
-# Speed used when no edge vectors are visible (creep forward until line reappears)
+# Speed used when no edge vectors are visible at a known junction (pending dir)
 NO_VECTOR_SPEED     = 0.15
 
 # ── ZONE_APPROACH auto-expiry ────────────────────────────────────────────────
@@ -269,20 +277,16 @@ class LineFollower(Node):
 
     def edge_vectors_callback(self, message):
         """
-        PID lane-following controller with directional bias.
+        PID lane-following controller with directional bias and boundary constraint.
 
-        Active only in TRACKING and ZONE_APPROACH states.
-
-        When in ZONE_APPROACH with a pending_direction:
-          - Edge vectors present → apply a bias to the PID error so the buggy
-            naturally leans toward the intended side while still tracking the line.
-          - No edge vectors → creep forward at NO_VECTOR_SPEED with the bias
-            applied as a direct steer value (no line to follow, just aim the
-            direction until the line reappears after the junction).
-
-        When TRACKING or ZONE_APPROACH with no pending direction:
-          - Edge vectors present → standard PID.
-          - No edge vectors → creep forward straight.
+        Boundary rules (highest priority, always enforced):
+          2 vectors : Normal PID — buggy is safely between both lane lines.
+          1 vector  : Buggy is near the visible boundary. Steer away from it at
+                      reduced speed. PID directional bias still applied on top.
+          0 vectors + pending_direction : Known junction — creep at NO_VECTOR_SPEED
+                      in the intended direction.
+          0 vectors + no pending_direction : Completely lost — STOP. Do not move
+                      blind without knowing where the boundary is.
 
         ZONE_APPROACH timeout: revert to TRACKING if no sign seen for
         ZONE_APPROACH_TIMEOUT seconds.
@@ -300,35 +304,68 @@ class LineFollower(Node):
             )
             self.pending_direction = None
 
-        # ── Directional bias value for this frame ──────────────────────
+        # ── Directional bias for this frame ───────────────────────────
         if self.pending_direction == 'Left':
             bias = TURN_BIAS_LEFT
         elif self.pending_direction == 'Right':
             bias = TURN_BIAS_RIGHT
         else:
-            bias = 0.0  # Straight or no pending direction — pure PID
+            bias = 0.0
 
         speed_cap = SPEED_MAX * ZONE_SPEED_FRACTION if self.current_state == State.ZONE_APPROACH else SPEED_MAX
+        half_width = float(message.image_width) / 2.0
 
-        half_width = message.image_width / 2.0
-
-        # ── No edge vectors → creep forward in the intended direction ──
+        # ════════════════════════════════════════════════════════════════
+        #  CASE 0: No edge vectors at all
+        # ════════════════════════════════════════════════════════════════
         if message.vector_count == 0:
-            self.target_speed = NO_VECTOR_SPEED
-            self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
+            if self.pending_direction is not None:
+                # Known junction gap — creep in the intended direction.
+                self.target_speed = NO_VECTOR_SPEED
+                self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
+            else:
+                # Completely lost and no known direction — stop to avoid
+                # crossing the boundary blind.
+                self.target_speed = 0.0
+                self.target_turn  = 0.0
+                self.get_logger().warn(
+                    "[BOUNDARY] No edge vectors and no pending direction — stopping."
+                )
             return
 
-        # ── Compute centroid_x from available vectors ──────────────────
-        if message.vector_count == 2:
-            x1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-            x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
-            centroid_x = (x1 + x2) / 2.0
-        else:
-            centroid_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+        # ════════════════════════════════════════════════════════════════
+        #  CASE 1: Single vector — near one boundary, steer away from it
+        # ════════════════════════════════════════════════════════════════
+        if message.vector_count == 1:
+            # Determine which side the visible boundary is on.
+            vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
 
-        # ── Normalised lateral error + directional bias ────────────────
-        # Positive error → centroid right of centre → steer right (negative turn).
-        # Bias shifts the error so PID leans toward the intended direction.
+            if vec_x < half_width:
+                # Boundary is on the LEFT — steer right to stay clear.
+                boundary_turn = -BOUNDARY_CORRECTION_TURN
+            else:
+                # Boundary is on the RIGHT — steer left to stay clear.
+                boundary_turn = BOUNDARY_CORRECTION_TURN
+
+            # Blend boundary correction with directional bias.
+            # Boundary always wins if they conflict (abs comparison).
+            if abs(bias) > 0 and (bias * boundary_turn < 0):
+                # Bias and boundary correction oppose each other — boundary wins.
+                self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_turn))
+            else:
+                self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_turn + bias))
+
+            self.target_speed = min(BOUNDARY_SPEED_CAP, speed_cap)
+            return
+
+        # ════════════════════════════════════════════════════════════════
+        #  CASE 2: Both vectors visible — standard PID with bias
+        # ════════════════════════════════════════════════════════════════
+        x1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+        x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
+        centroid_x = (x1 + x2) / 2.0
+
+        # Normalised lateral error + directional bias.
         error = (centroid_x - half_width) / half_width + bias
 
         self.integral   += error

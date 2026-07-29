@@ -264,9 +264,6 @@ class LineFollower(Node):
         self._turn_done_count    = 0
         self.avoiding            = False
         self.target_sign_seen    = False
-        self.dir_sign_visible    = False  # kept for compat but unused now
-        self.dir_sign_gap_open   = False
-        self._last_dir_sign_time = None
         self.get_logger().info(
             f"[MISSION] {old} → {new_target} (look for sign '{sign}' / QR '{new_target}')"
         )
@@ -277,40 +274,75 @@ class LineFollower(Node):
 
     def sign_board_callback(self, message):
         """
-        Directional sign (Left/Right/Straight):
-          - Lock pending_direction on first detection.
-          - Only allow overwrite when the previous turn is done
-            (_turn_done_count >= TURN_DONE_FRAMES means bias dropped = turn complete).
+        Parses the board map published by ObjectRecognizer and:
 
-        Location sign matching active_target:
-          - Set target_sign_seen so lidar_callback enables close-approach logic.
+        1. Extracts the direction paired with the active target's character.
+           e.g. active_target='PATIENT_1' → expected_sign='A'
+                MAP message "MAP:A=Left,B=Left,C=Straight,X=Straight,Y=Right,Z=Right"
+                → pending_direction = 'Left'
+
+        2. Marks target_sign_seen=True when the active target's character
+           is present on the board (enables creep-and-stop approach via LIDAR).
+
+        Message format from ObjectRecognizer:
+          "MAP:<char>=<dir>,<char>=<dir>,..."
+          e.g. "MAP:A=Left,B=Left,C=Straight,X=Straight,Y=Right,Z=Right"
         """
         if self.current_state == State.MISSION_COMPLETE:
             return
 
-        sign = message.data
-        if not sign:
+        raw = message.data
+        if not raw:
             return
 
-        expected_sign       = TARGET_SIGN_MAP.get(self.active_target, "")
-        is_target_sign      = (sign == expected_sign)
-        is_directional_sign = (sign in DIRECTIONAL_SIGNS)
-
-        if not (is_target_sign or is_directional_sign):
+        # ── Parse MAP message ────────────────────────────────────────────
+        if not raw.startswith("MAP:"):
             return
 
-        if is_directional_sign:
-            if self.pending_direction != sign:
-                self.pending_direction = sign
-                self._turn_done_count  = 0
-                self.get_logger().info(f"[SIGN] Direction: '{sign}'.")
+        # Build dict from "A=Left,B=Left,C=Straight,..."
+        char_dir_map = {}
+        try:
+            pairs = raw[4:].split(",")
+            for pair in pairs:
+                if "=" in pair:
+                    ch, dr = pair.split("=", 1)
+                    char_dir_map[ch.strip()] = dr.strip()
+        except Exception:
+            self.get_logger().warn(f"[SIGN] Could not parse board message: '{raw}'")
+            return
 
-        elif is_target_sign and self.current_state != State.SERVER_HANDSHAKE:
-            if not self.target_sign_seen:
-                self.target_sign_seen = True
-                self.get_logger().info(
-                    f"[SIGN] Target '{sign}' seen — approach mode active."
-                )
+        if not char_dir_map:
+            return
+
+        expected_sign = TARGET_SIGN_MAP.get(self.active_target, "")
+
+        # ── Check if our target character is on the board ────────────────
+        if expected_sign not in char_dir_map:
+            return
+
+        # ── Mark approach mode ───────────────────────────────────────────
+        if self.current_state != State.SERVER_HANDSHAKE and not self.target_sign_seen:
+            self.target_sign_seen = True
+            self.get_logger().info(
+                f"[SIGN] Target '{expected_sign}' seen on board — approach mode active."
+            )
+
+        # ── Extract and apply direction for our target ───────────────────
+        direction = char_dir_map[expected_sign]
+
+        if direction not in DIRECTIONAL_SIGNS:
+            self.get_logger().warn(
+                f"[SIGN] Unknown direction '{direction}' for target '{expected_sign}'."
+            )
+            return
+
+        if self.pending_direction != direction:
+            self.pending_direction = direction
+            self._turn_done_count  = 0
+            self.get_logger().info(
+                f"[SIGN] Target '{expected_sign}' → Direction: '{direction}' "
+                f"(full board: {char_dir_map})."
+            )
 
 
     # ================================================================== #
@@ -380,14 +412,6 @@ class LineFollower(Node):
                 self.target_speed = AVOIDANCE_SPEED
                 self.target_turn  = self.avoidance_turn_value
             return
-
-        # ── Directional sign gap timer ─────────────────────────────────────
-        if (self.dir_sign_visible
-                and self._last_dir_sign_time is not None
-                and time.time() - self._last_dir_sign_time > DIR_SIGN_TIMEOUT):
-            self.dir_sign_visible  = False
-            self.dir_sign_gap_open = True
-            self.get_logger().info("[SIGN] Green board gone — gap open.")
 
         # ── Directional bias ──────────────────────────────────────────────
         if self.pending_direction == 'Left':

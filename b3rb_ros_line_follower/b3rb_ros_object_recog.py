@@ -22,29 +22,45 @@ import numpy as np
 
 
 # Confidence threshold: detections below this score are discarded.
-CONFIDENCE_THRESHOLD = 0.7
+CONFIDENCE_THRESHOLD = 0.5
 
 # Input resolution expected by the ONNX model.
 MODEL_INPUT_SIZE = (512, 512)
 
-# Class labels matching model output rows 4-12 (row index = class index).
+# Class labels — index matches model output rows 4-12.
 CLASS_NAMES = ['A', 'B', 'C', 'Left', 'Right', 'Straight', 'X', 'Y', 'Z']
+
+# Which labels are location characters vs direction arrows.
+CHAR_CLASSES = {'A', 'B', 'C', 'X', 'Y', 'Z'}
+DIR_CLASSES  = {'Left', 'Right', 'Straight'}
+
+# IoU threshold for Non-Maximum Suppression.
+NMS_IOU_THRESHOLD = 0.45
+
+# Maximum pixel distance (in model-input-space) to pair a char with a direction.
+PAIR_X_TOLERANCE = 60   # pixels at 512-wide input scale
 
 
 class ObjectRecognizer(Node):
     """
-    ROS 2 Node that processes raw camera images to recognize NXP Cup traffic sign boards.
+    ROS 2 Node that processes raw camera images to recognise NXP Cup traffic sign boards.
 
-    Pipeline per frame:
-      1. Crop image to top 50% (sign boards appear above the track floor).
-      2. Build a 512x512 normalized blob.
-      3. Run forward inference through an ONNX YOLOv8-style model.
-      4. The model outputs shape (1, 13, 5376):
-           - rows 0-3  : bounding box coordinates (skipped)
-           - rows 4-12 : 9 per-class confidence scores
-      5. If max confidence >= 0.7, publish class label to /sign_board_detection.
+    Pipeline per frame
+    ------------------
+    1. Crop image to top 50% (sign boards appear above the track floor).
+    2. Build a 512×512 normalised blob.
+    3. Run forward inference through an ONNX YOLOv8-style model.
+    4. The model outputs shape (1, 13, N):
+         - rows 0-3  : cx, cy, w, h  (centre-format bounding box)
+         - rows 4-12 : 9 per-class confidence scores
+    5. Decode all detections, apply NMS per class.
+    6. Pair each character detection with the direction detection whose
+       x-centre is closest (within PAIR_X_TOLERANCE pixels).
+    7. Publish one message per pair: "<char>:<direction>"  e.g. "A:Left"
+       Also publish the full board map once per frame:
+         "MAP:A=Left,B=Left,C=Straight,X=Straight,Y=Right,Z=Right"
 
-    Hardware: CUDA backend is attempted first; falls back to CPU if unavailable.
+    Topic published: /sign_board_detection  (std_msgs/String)
     """
 
     def __init__(self):
@@ -54,7 +70,7 @@ class ObjectRecognizer(Node):
         #  Load ONNX model                                                    #
         # ------------------------------------------------------------------ #
         self.net = None
-        dir_path = os.path.dirname(os.path.abspath(__file__))
+        dir_path   = os.path.dirname(os.path.abspath(__file__))
         model_path = os.path.join(dir_path, 'best.onnx')
 
         self.get_logger().info(f"[INIT] Looking for ONNX model at: {model_path}")
@@ -69,25 +85,19 @@ class ObjectRecognizer(Node):
                 self.net = cv2.dnn.readNetFromONNX(model_path)
                 self.get_logger().info("[INIT] ONNX model loaded successfully.")
 
-                # Attempt CUDA acceleration; fall back to CPU if unavailable.
-                cuda_available = False
+                # Attempt CUDA; fall back to CPU.
                 try:
                     self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
                     self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                    # Probe with a tiny dummy blob to confirm CUDA actually works.
                     dummy = cv2.dnn.blobFromImage(
                         np.zeros((8, 8, 3), dtype=np.uint8),
                         scalefactor=1.0 / 255.0,
-                        size=(8, 8),
-                        swapRB=True,
-                        crop=False,
+                        size=(8, 8), swapRB=True, crop=False,
                     )
                     self.net.setInput(dummy)
                     self.net.forward()
-                    cuda_available = True
                     self.get_logger().info("[INIT] CUDA backend confirmed — using GPU inference.")
                 except Exception:
-                    # CUDA not available or not working; fall back to CPU.
                     self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
                     self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
                     self.get_logger().info("[INIT] CUDA unavailable — falling back to CPU inference.")
@@ -100,7 +110,7 @@ class ObjectRecognizer(Node):
                 self.net = None
 
         # ------------------------------------------------------------------ #
-        #  Subscription: compressed camera feed                               #
+        #  Subscription / Publisher                                           #
         # ------------------------------------------------------------------ #
         self.subscription_camera = self.create_subscription(
             CompressedImage,
@@ -109,25 +119,18 @@ class ObjectRecognizer(Node):
             10,
         )
 
-        # ------------------------------------------------------------------ #
-        #  Publisher: detected sign label                                     #
-        # ------------------------------------------------------------------ #
         self.publisher_sign = self.create_publisher(
             String,
             '/sign_board_detection',
             10,
         )
 
-        # Frame counter — reduces log spam (log every 30th frame at INFO level).
         self._frame_count = 0
-
-        # Track last published sign to avoid duplicate log lines.
-        self._last_sign = None
+        self._last_map_str = ""   # last published MAP string — avoid spam
 
         self.get_logger().info(
-            "[INIT] ObjectRecognizer node ready. "
-            f"Class map: {CLASS_NAMES}. "
-            f"Confidence threshold: {CONFIDENCE_THRESHOLD}."
+            "[INIT] ObjectRecognizer ready. "
+            f"Classes: {CLASS_NAMES}. Conf threshold: {CONFIDENCE_THRESHOLD}."
         )
 
     # ---------------------------------------------------------------------- #
@@ -135,61 +138,64 @@ class ObjectRecognizer(Node):
     # ---------------------------------------------------------------------- #
 
     def camera_image_callback(self, message):
-        """Decode compressed image and run sign classification."""
         self._frame_count += 1
 
         np_arr = np.frombuffer(message.data, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        image  = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
         if image is None:
-            self.get_logger().warn("[CAM] Failed to decode compressed image — skipping frame.")
+            self.get_logger().warn("[CAM] Failed to decode compressed image — skipping.")
             return
 
         if self._frame_count % 30 == 0:
             self.get_logger().info(
-                f"[CAM] Processing frame #{self._frame_count} "
-                f"(size {image.shape[1]}x{image.shape[0]})."
+                f"[CAM] Frame #{self._frame_count} "
+                f"({image.shape[1]}x{image.shape[0]})"
             )
 
-        sign_label, max_score = self.classify_sign(image)
+        char_dir_map = self.detect_sign_map(image)
 
-        if sign_label is not None:
-            msg = String()
-            msg.data = sign_label
-            self.publisher_sign.publish(msg)
-            # Only log when the detected sign changes.
-            if sign_label != self._last_sign:
-                self.get_logger().info(
-                    f"[SIGN] DETECTED: '{sign_label}' (confidence={max_score:.3f})"
-                )
-                self._last_sign = sign_label
-        else:
-            if self._last_sign is not None:
-                self.get_logger().info("[SIGN] No sign in view.")
-                self._last_sign = None
+        if not char_dir_map:
+            if self._last_map_str:
+                self.get_logger().info("[SIGN] Board no longer in view.")
+                self._last_map_str = ""
+            return
+
+        # ── Publish MAP message (full board) ──────────────────────────────
+        map_str = "MAP:" + ",".join(
+            f"{ch}={dr}" for ch, dr in sorted(char_dir_map.items())
+        )
+        if map_str != self._last_map_str:
+            self.get_logger().info(f"[SIGN] Board map: {map_str}")
+            self._last_map_str = map_str
+
+        msg      = String()
+        msg.data = map_str
+        self.publisher_sign.publish(msg)
 
     # ---------------------------------------------------------------------- #
-    #  Inference logic                                                        #
+    #  Full detection pipeline                                                #
     # ---------------------------------------------------------------------- #
 
-    def classify_sign(self, image):
+    def detect_sign_map(self, image):
         """
-        Run ONNX inference on the top 50% of the input frame.
+        Run YOLOv8 inference and return a dict mapping each detected
+        character to its paired direction.
 
         Returns
         -------
-        (label: str | None, max_score: float)
-            label     : class name when confidence >= CONFIDENCE_THRESHOLD, else None.
-            max_score : highest confidence value found across all classes and anchors.
+        dict[str, str]  e.g. {'A': 'Left', 'B': 'Left', 'C': 'Straight'}
+        Empty dict when nothing is detected or model is not loaded.
         """
         if image is None or self.net is None:
-            return None, 0.0
+            return {}
 
-        # 1. Crop to top 50% — sign boards are above the track surface.
-        h = image.shape[0]
-        cropped = image[0 : h // 2, :, :]
+        # 1. Crop top 50%.
+        h        = image.shape[0]
+        cropped  = image[0 : h // 2, :, :]
+        crop_h, crop_w = cropped.shape[:2]
 
-        # 2. Build normalized blob: scale=1/255, size=512x512, swap BGR→RGB, no crop.
+        # 2. Build blob.
         blob = cv2.dnn.blobFromImage(
             cropped,
             scalefactor=1.0 / 255.0,
@@ -198,35 +204,127 @@ class ObjectRecognizer(Node):
             crop=False,
         )
 
-        # 3. Forward pass — expected output shape: (1, 13, 5376).
+        # 3. Forward pass.
         self.net.setInput(blob)
         try:
-            preds = self.net.forward()
+            preds = self.net.forward()   # shape: (1, 13, N)
         except Exception as exc:
-            # Only log forward-pass errors once per 30 frames to avoid spam.
             if self._frame_count % 30 == 0:
                 self.get_logger().error(f"[INFER] Forward pass failed: {exc}")
-            return None, 0.0
+            return {}
 
-        if preds.shape[1] < 13:
+        if preds.ndim != 3 or preds.shape[1] < 13:
             if self._frame_count % 30 == 0:
                 self.get_logger().error(
-                    f"[INFER] Unexpected output shape {preds.shape} — expected (1, 13, N)."
+                    f"[INFER] Unexpected output shape {preds.shape}."
                 )
-            return None, 0.0
+            return {}
 
-        # 4. Class confidence matrix: skip first 4 rows (bbox), take rows 4-12 → shape (9, N).
-        scores_matrix = preds[0][4:, :]   # shape: (9, 5376)
+        # 4. Decode detections.
+        #    preds[0] shape: (13, N)
+        #    rows 0-3 : cx, cy, w, h  (normalised to MODEL_INPUT_SIZE)
+        #    rows 4-12: class confidence scores
+        output   = preds[0]           # (13, N)
+        boxes_xywh  = output[:4, :].T   # (N, 4)  cx cy w h
+        scores_all  = output[4:,  :].T  # (N, 9)
 
-        max_score = float(np.max(scores_matrix))
+        detections = self._decode_detections(boxes_xywh, scores_all)
 
-        if max_score >= CONFIDENCE_THRESHOLD:
-            class_idx, _ = np.unravel_index(
-                np.argmax(scores_matrix), scores_matrix.shape
+        if not detections:
+            return {}
+
+        # 5. Separate characters from directions.
+        chars = [(label, cx, score) for label, cx, score in detections if label in CHAR_CLASSES]
+        dirs  = [(label, cx, score) for label, cx, score in detections if label in DIR_CLASSES]
+
+        if self._frame_count % 30 == 0:
+            self.get_logger().info(
+                f"[DETECT] chars={[(l,round(x)) for l,x,_ in chars]} "
+                f"dirs={[(l,round(x)) for l,x,_ in dirs]}"
             )
-            return CLASS_NAMES[class_idx], max_score
 
-        return None, max_score
+        if not chars or not dirs:
+            return {}
+
+        # 6. Pair each character to the closest direction by x-centre.
+        char_dir_map = {}
+        for char_label, char_cx, _ in chars:
+            best_dir   = None
+            best_dist  = float('inf')
+            for dir_label, dir_cx, _ in dirs:
+                dist = abs(char_cx - dir_cx)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_dir  = dir_label
+            if best_dir is not None and best_dist <= PAIR_X_TOLERANCE:
+                char_dir_map[char_label] = best_dir
+
+        return char_dir_map
+
+    # ---------------------------------------------------------------------- #
+    #  Decode + NMS helper                                                    #
+    # ---------------------------------------------------------------------- #
+
+    def _decode_detections(self, boxes_xywh, scores_all):
+        """
+        Apply per-class NMS and return a flat list of
+        (class_label, cx_in_model_pixels, confidence).
+
+        Parameters
+        ----------
+        boxes_xywh : np.ndarray  (N, 4)  — cx, cy, w, h normalised 0-1
+        scores_all : np.ndarray  (N, 9)  — per-class confidence scores
+        """
+        results = []
+
+        # Convert normalised cx/cy/w/h → pixel x1,y1,x2,y2 in model space.
+        W = MODEL_INPUT_SIZE[0]
+        H = MODEL_INPUT_SIZE[1]
+
+        cx = boxes_xywh[:, 0] * W
+        cy = boxes_xywh[:, 1] * H
+        w  = boxes_xywh[:, 2] * W
+        h  = boxes_xywh[:, 3] * H
+
+        x1 = cx - w / 2.0
+        y1 = cy - h / 2.0
+        x2 = cx + w / 2.0
+        y2 = cy + h / 2.0
+
+        # Per-class NMS.
+        for cls_idx, cls_name in enumerate(CLASS_NAMES):
+            cls_scores = scores_all[:, cls_idx]
+            mask       = cls_scores >= CONFIDENCE_THRESHOLD
+
+            if not np.any(mask):
+                continue
+
+            cls_boxes  = np.stack([x1[mask], y1[mask], x2[mask], y2[mask]], axis=1)
+            cls_confs  = cls_scores[mask]
+            cls_cx     = cx[mask]
+
+            # cv2.dnn.NMSBoxes expects list of [x, y, w, h].
+            nms_input = [[float(b[0]), float(b[1]),
+                          float(b[2] - b[0]), float(b[3] - b[1])]
+                         for b in cls_boxes]
+
+            indices = cv2.dnn.NMSBoxes(
+                nms_input,
+                cls_confs.tolist(),
+                CONFIDENCE_THRESHOLD,
+                NMS_IOU_THRESHOLD,
+            )
+
+            if len(indices) == 0:
+                continue
+
+            # indices may be (N,1) or (N,) depending on OpenCV version.
+            indices = indices.flatten() if hasattr(indices, 'flatten') else list(indices)
+
+            for i in indices:
+                results.append((cls_name, float(cls_cx[i]), float(cls_confs[i])))
+
+        return results
 
 
 # --------------------------------------------------------------------------- #
@@ -239,7 +337,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("[SHUTDOWN] KeyboardInterrupt received — shutting down ObjectRecognizer.")
+        node.get_logger().info("[SHUTDOWN] KeyboardInterrupt — shutting down ObjectRecognizer.")
     finally:
         node.destroy_node()
         rclpy.shutdown()

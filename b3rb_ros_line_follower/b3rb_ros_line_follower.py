@@ -55,9 +55,14 @@ NO_VECTOR_SPEED     = 0.15
 ZONE_APPROACH_TIMEOUT  = 5.0   # seconds without a new sign → revert to TRACKING
 
 # ── PID gains ───────────────────────────────────────────────────────────────
-KP = 0.6
+KP = 0.35
 KI = 0.0
-KD = 0.15
+KD = 0.25
+
+# ── Steering deadband ────────────────────────────────────────────────────────
+# Normalised errors smaller than this are treated as zero — prevents the buggy
+# reacting to minor camera noise when driving straight.
+STEERING_DEADBAND = 0.05
 
 
 # ── FSM States ───────────────────────────────────────────────────────────────
@@ -367,6 +372,10 @@ class LineFollower(Node):
 
         # Normalised lateral error + directional bias.
         error = (centroid_x - half_width) / half_width + bias
+
+        # Deadband — ignore tiny errors to suppress straight-road wobble.
+        if abs(error) < STEERING_DEADBAND:
+            error = 0.0
 
         self.integral   += error
         derivative       = error - self.prev_error

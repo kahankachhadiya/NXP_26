@@ -319,19 +319,33 @@ class LineFollower(Node):
         # but edge vectors are the hard constraint — they always win.
         if self.current_state == State.OBSTACLE_AVOIDANCE:
             if message.vector_count == 2:
-                # Both lines visible — obstacle cleared and back inside track.
-                if self.pending_direction is not None:
-                    self._transition(
-                        State.ZONE_APPROACH,
-                        "Back inside track after avoidance — resuming pending turn."
-                    )
-                    self.last_sign_time = time.time()
+                # Check vectors are on opposite sides — truly back inside track.
+                ax1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+                ax2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
+                hw  = float(message.image_width) / 2.0
+                if (ax1 < hw) != (ax2 < hw):   # straddling centre
+                    if self.pending_direction is not None:
+                        self._transition(
+                            State.ZONE_APPROACH,
+                            "Back inside track after avoidance — resuming pending turn."
+                        )
+                        self.last_sign_time = time.time()
+                    else:
+                        self._transition(
+                            State.TRACKING,
+                            "Vectors on both sides — back inside track after avoidance."
+                        )
+                    # Fall through to normal PID below.
                 else:
-                    self._transition(
-                        State.TRACKING,
-                        "Both edge vectors visible — back inside track after avoidance."
-                    )
-                # Fall through to normal PID below.
+                    # Both vectors on same side — not fully inside yet, keep avoiding.
+                    half_width = float(message.image_width) / 2.0
+                    vec_x = (ax1 + ax2) / 2.0
+                    if vec_x < half_width:
+                        self.target_turn = -BOUNDARY_CORRECTION_TURN
+                    else:
+                        self.target_turn =  BOUNDARY_CORRECTION_TURN
+                    self.target_speed = AVOIDANCE_SPEED
+                    return
             elif message.vector_count == 1:
                 # One boundary visible — steer away from it (boundary wins over
                 # avoidance direction).
@@ -409,20 +423,32 @@ class LineFollower(Node):
             return
 
         # ════════════════════════════════════════════════════════════════
-        #  CASE 2: Both vectors visible — standard PID with bias
+        #  CASE 2: Both vectors visible — check they are on opposite sides
         # ════════════════════════════════════════════════════════════════
         x1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
         x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
         centroid_x = (x1 + x2) / 2.0
 
-        # ── Gate: only return to TRACKING when sign is gone AND on track ──
+        # Confirm vectors are on opposite sides of centre (left AND right boundary).
+        # If both are on the same side the buggy hasn't fully entered the new lane.
+        v1_left = x1 < half_width
+        v2_left = x2 < half_width
+        vectors_straddling = (v1_left != v2_left)   # one left, one right
+
+        # ── Gate: return to TRACKING only when sign gone AND straddling ──
         if (self.current_state == State.ZONE_APPROACH
-                and not self.sign_visible):
+                and not self.sign_visible
+                and vectors_straddling):
             self._transition(
                 State.TRACKING,
-                "Sign gone and both edge vectors visible — junction complete."
+                "Sign gone and vectors on both sides — junction complete."
             )
             self.pending_direction = None
+
+        # Once both vectors are on opposite sides the buggy is centred on the
+        # new road — drop the directional bias to stop wobbling on the straight.
+        if vectors_straddling:
+            bias = 0.0
 
         # Normalised lateral error + directional bias.
         error = (centroid_x - half_width) / half_width + bias

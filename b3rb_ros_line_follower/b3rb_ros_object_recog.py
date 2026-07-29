@@ -191,20 +191,26 @@ class ObjectRecognizer(Node):
             return {}
 
         # 1. Crop top 50%.
-        h        = image.shape[0]
-        cropped  = image[0 : h // 2, :, :]
-        crop_h, crop_w = cropped.shape[:2]
+        h, w = image.shape[:2]
+        cropped = image[0 : h // 2, 0 : w]
 
-        # 2. Build blob.
+        # 2. Letterbox: pad to square so the model sees undistorted aspect ratio.
+        #    Without this, blobFromImage squashes the wide crop to 512x512,
+        #    making signs look unnaturally tall/skinny and breaking inference.
+        max_dim = max(cropped.shape[0], cropped.shape[1])
+        square_image = np.zeros((max_dim, max_dim, 3), dtype=np.uint8)
+        square_image[0:cropped.shape[0], 0:cropped.shape[1]] = cropped
+
+        # 3. Build blob from the square image.
         blob = cv2.dnn.blobFromImage(
-            cropped,
+            square_image,
             scalefactor=1.0 / 255.0,
             size=MODEL_INPUT_SIZE,
             swapRB=True,
             crop=False,
         )
 
-        # 3. Forward pass.
+        # 4. Forward pass.
         self.net.setInput(blob)
         try:
             preds = self.net.forward()   # shape: (1, 13, N)

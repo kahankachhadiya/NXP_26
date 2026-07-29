@@ -33,31 +33,30 @@ TURN_MAX   =  1.0
 TURN_MIN   = -1.0
 
 # ── Directional bias applied to PID error when a turn sign is pending ───────
-TURN_BIAS_LEFT     =  0.4   # added to normalised error (pushes PID left)
-TURN_BIAS_RIGHT    = -0.4   # added to normalised error (pushes PID right)
+TURN_BIAS_LEFT     =  0.48   # added to normalised error (pushes PID left)
+TURN_BIAS_RIGHT    = -0.48   # added to normalised error (pushes PID right)
 
 # ── Boundary constraint ──────────────────────────────────────────────────────
 BOUNDARY_CORRECTION_TURN = 0.5   # turn magnitude when only one vector visible
-BOUNDARY_SPEED_CAP       = 0.2   # speed cap during boundary correction
+BOUNDARY_SPEED_CAP       = 0.24  # speed cap during boundary correction (+20%)
 
 # ── Speed while navigating a ZONE_APPROACH ──────────────────────────────────
-ZONE_SPEED_FRACTION = 0.4    # fraction of SPEED_MAX in ZONE_APPROACH
-NO_VECTOR_SPEED     = 0.15   # creep speed at a known junction gap
+ZONE_SPEED_FRACTION = 0.48   # fraction of SPEED_MAX in ZONE_APPROACH (+20%)
+NO_VECTOR_SPEED     = 0.18   # creep speed at a known junction gap (+20%)
 
 # ── Obstacle avoidance (TRACKING state) ─────────────────────────────────────
-AVOIDANCE_SPEED    = 0.15   # forward speed while steering around obstacle
-AVOIDANCE_TURN     = 0.6    # turn magnitude — direction chosen from LIDAR clearance
-AVOIDANCE_THRESHOLD = 0.8   # metres — triggers avoidance in TRACKING
+AVOIDANCE_SPEED     = 0.18   # forward speed while steering around obstacle (+20%)
+AVOIDANCE_TURN      = 0.6    # turn magnitude — direction chosen from LIDAR clearance
+AVOIDANCE_THRESHOLD = 0.8    # metres — triggers avoidance in TRACKING
 
 # ── Target approach (ZONE_APPROACH state) ────────────────────────────────────
-# In ZONE_APPROACH the building/patient is the destination, not an obstacle.
-# Creep forward slowly and stop very close so the QR code is in scan range.
-APPROACH_CREEP_THRESHOLD = 0.6   # metres — start slowing down
-APPROACH_STOP_THRESHOLD  = 0.35  # metres — stop and wait for QR scan
+APPROACH_CREEP_THRESHOLD = 0.6    # metres — start slowing down
+APPROACH_STOP_THRESHOLD  = 0.35   # metres — stop and wait for QR scan
 
-# ── ZONE_APPROACH auto-expiry ────────────────────────────────────────────────
-ZONE_APPROACH_TIMEOUT   = 5.0   # seconds without a new sign → mark sign as gone
-STRADDLE_CONFIRM_FRAMES = 8     # consecutive frames with vectors on both sides → TRACKING
+# ── ZONE_APPROACH sign-gap exit ───────────────────────────────────────────────
+# Exit ZONE_APPROACH when a NEW sign is detected after the previous one
+# disappeared. The gap confirms the turn is done and we are on a new road.
+ZONE_APPROACH_TIMEOUT = 5.0   # seconds without sign → mark sign as gone (gap started)
 
 # ── PID gains ───────────────────────────────────────────────────────────────
 KP = 0.25
@@ -65,14 +64,10 @@ KI = 0.0
 KD = 0.08
 
 # ── Boundary proximity steering ──────────────────────────────────────────────
-# The buggy does NOT try to stay at centre. It only corrects when the centroid
-# drifts into the danger zone near a boundary (within BOUNDARY_ZONE of either
-# edge). Inside the safe zone the error is zeroed — buggy goes straight.
-#
-# BOUNDARY_ZONE: fraction of half-width from each edge that triggers correction.
-#   e.g. 0.35 means correction starts when centroid is within 35% of half-width
-#   from either boundary line.  The middle 30% of the road is a free zone.
 BOUNDARY_ZONE = 0.35
+
+# ── Base straight speed (+20% from original) ────────────────────────────────
+STRAIGHT_SPEED = 0.18   # used as initial target_speed and NO_VECTOR_SPEED fallback
 
 # ── Speed control ────────────────────────────────────────────────────────────
 SPEED_REDUCTION_THRESHOLD = 0.3
@@ -177,7 +172,7 @@ class LineFollower(Node):
         )
 
         # ── Control outputs ────────────────────────────────────────────────
-        self.target_speed = 0.15
+        self.target_speed = STRAIGHT_SPEED
         self.target_turn  = 0.0
 
         # ── PID state ─────────────────────────────────────────────────────
@@ -194,24 +189,20 @@ class LineFollower(Node):
         # Set by lidar_callback; +ve = left, -ve = right.
         self.avoidance_turn_value = 0.0
 
-        # ── ZONE_APPROACH timeout ──────────────────────────────────────────
+        # ── ZONE_APPROACH timeout (location signs only) ───────────────────────
         self.last_sign_time = None
 
-        # ── Sign visibility tracking ───────────────────────────────────────
-        # True while sign detections are arriving. Flips to False after
-        # ZONE_APPROACH_TIMEOUT with no detection. TRACKING is only entered
-        # once BOTH this is False AND both edge vectors are visible.
-        self.sign_visible = False
+        # ── Location sign visibility tracking (ZONE_APPROACH only) ───────────
+        # loc_sign_visible: True while a location sign (A/B/C/X/Y/Z) is arriving.
+        self.loc_sign_visible = False
 
-        # ── Stable straddle counter ────────────────────────────────────────
-        # Counts consecutive frames where vector_1 and vector_2 are on
-        # opposite sides of image centre (one left, one right = on new road).
-        # TRACKING is entered when this reaches STRADDLE_CONFIRM_FRAMES.
-        self._straddle_count = 0
-
-        # Hard fallback: if sign gone but straddle never confirmed within this
-        # many seconds, force TRACKING anyway to avoid permanent ZONE_APPROACH.
-        self._sign_gone_time = None
+        # ── Directional sign (green board) gap tracking (TRACKING only) ──────
+        # dir_sign_visible:  True while a directional sign detection is arriving.
+        # dir_sign_gap_open: True after the board disappears — next detection
+        #   means we are at a new board → clear pending_direction and lock fresh one.
+        self.dir_sign_visible    = False
+        self.dir_sign_gap_open   = False
+        self._last_dir_sign_time = None
 
         # ── Throttle counters for high-frequency callbacks ─────────────────
         self._pid_log_counter   = 0
@@ -307,9 +298,9 @@ class LineFollower(Node):
         self.integral          = 0.0
         self.prev_error        = 0.0
         self.pending_direction = None
-        self.sign_visible      = False
-        self._straddle_count   = 0
-        self._sign_gone_time   = None
+        self.loc_sign_visible  = False
+        self.dir_sign_visible  = False
+        self.dir_sign_gap_open = False
         self.get_logger().info(
             f"[MISSION] Target updated: '{old}' → '{new_target}' "
             f"(look for sign '{sign}' / QR containing '{new_target}')."
@@ -344,7 +335,6 @@ class LineFollower(Node):
         # but edge vectors are the hard constraint — they always win.
         if self.current_state == State.OBSTACLE_AVOIDANCE:
             if message.vector_count == 2:
-                # Check vectors are on opposite sides — truly back inside track.
                 ax1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
                 ax2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
                 hw  = float(message.image_width) / 2.0
@@ -354,7 +344,8 @@ class LineFollower(Node):
                             State.ZONE_APPROACH,
                             "Back inside track after avoidance — resuming pending turn."
                         )
-                        self.last_sign_time = time.time()
+                        self.last_sign_time   = time.time()
+                        self.loc_sign_visible = False
                     else:
                         self._transition(
                             State.TRACKING,
@@ -388,18 +379,27 @@ class LineFollower(Node):
                 self.target_turn  = self.avoidance_turn_value
                 return
 
-        # ── ZONE_APPROACH: mark sign as gone after timeout ────────────────
+        # ── ZONE_APPROACH: open gap after sign timeout ────────────────────
         if (self.current_state == State.ZONE_APPROACH
                 and self.last_sign_time is not None
                 and time.time() - self.last_sign_time > ZONE_APPROACH_TIMEOUT):
-            if self.sign_visible:
-                self.sign_visible    = False
-                self._sign_gone_time = time.time()
-                self._straddle_count = 0
+            if self.loc_sign_visible:
+                self.loc_sign_visible = False
                 self.get_logger().info(
-                    "[ZONE] Sign disappeared — waiting for stable straddle "
-                    "before returning to TRACKING."
+                    "[ZONE] Location sign disappeared — waiting for QR scan."
                 )
+
+        # ── TRACKING: green board gap — mark when directional sign disappears ─
+        if (self.current_state == State.TRACKING
+                and self.dir_sign_visible
+                and self._last_dir_sign_time is not None
+                and time.time() - self._last_dir_sign_time > ZONE_APPROACH_TIMEOUT):
+            self.dir_sign_visible  = False
+            self.dir_sign_gap_open = True
+            self.get_logger().info(
+                "[SIGN] Green board gone — gap open, next board detection "
+                "will reset direction and lock the new sign."
+            )
 
         # ── Directional bias for this frame ───────────────────────────
         if self.pending_direction == 'Left':
@@ -450,31 +450,14 @@ class LineFollower(Node):
             return
 
         # ════════════════════════════════════════════════════════════════
-        #  CASE 2: Both vectors visible — check nearest on each side
+        #  CASE 2: Both vectors visible
         # ════════════════════════════════════════════════════════════════
         x1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
         x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
         centroid_x = (x1 + x2) / 2.0
 
-        # Straddle check: one vector left of centre, one right.
+        # Drop bias once vectors are on opposite sides — buggy is on new road.
         vectors_straddling = (x1 < half_width) != (x2 < half_width)
-
-        if self.current_state == State.ZONE_APPROACH and not self.sign_visible:
-            if vectors_straddling:
-                self._straddle_count += 1
-                if self._straddle_count >= STRADDLE_CONFIRM_FRAMES:
-                    self._transition(
-                        State.TRACKING,
-                        f"Straddle confirmed ({STRADDLE_CONFIRM_FRAMES} frames) — junction complete."
-                    )
-                    self.pending_direction = None
-                    self._straddle_count   = 0
-                    self._sign_gone_time   = None
-            else:
-                # Vectors still on same side — reset counter, turn not done yet.
-                self._straddle_count = 0
-
-        # Drop bias once straddling — buggy is centred on the new road.
         if vectors_straddling:
             bias = 0.0
 
@@ -598,17 +581,17 @@ class LineFollower(Node):
         """
         React to a detected traffic sign board.
 
-        Logic
-        -----
-        - If the sign matches the mapped label for active_target OR is a
-          directional sign (Left/Right/Straight), enter ZONE_APPROACH and
-          store the intended direction as pending_direction.
-        - pending_direction is used in edge_vectors_callback to bias the PID
-          toward the correct side — the turn happens naturally as the buggy
-          tracks the line through the junction.
-        - If no edge vectors are visible at the junction, the buggy creeps
-          forward in the pending_direction until the line reappears.
-        - Signs irrelevant to the current target are ignored.
+        Directional signs (Left/Right/Straight — the green board):
+          - Handled entirely within TRACKING state.
+          - Sets pending_direction which biases PID through the junction.
+          - Does NOT enter ZONE_APPROACH.
+          - Gap logic: direction is locked on first detection; cleared after
+            the sign disappears and reappears (fresh detection after a gap),
+            allowing a new board to overwrite the stale direction.
+
+        Location signs (A/B/C/X/Y/Z — the patient/hospital marker):
+          - Enters ZONE_APPROACH so the buggy slows and creeps to the building.
+          - QR scan happens in ZONE_APPROACH.
         """
         if self.current_state in (State.MISSION_COMPLETE, State.OBSTACLE_AVOIDANCE):
             return
@@ -617,29 +600,47 @@ class LineFollower(Node):
         if not sign:
             return
 
-        expected_sign = TARGET_SIGN_MAP.get(self.active_target, "")
+        expected_sign       = TARGET_SIGN_MAP.get(self.active_target, "")
         is_target_sign      = (sign == expected_sign)
         is_directional_sign = (sign in DIRECTIONAL_SIGNS)
 
-        if is_target_sign or is_directional_sign:
-            if self.current_state != State.ZONE_APPROACH:
-                self._transition(
-                    State.ZONE_APPROACH,
-                    f"Sign '{sign}' triggered zone approach "
-                    f"({'target match' if is_target_sign else 'directional'})."
+        if not (is_target_sign or is_directional_sign):
+            return
+
+        # ── Directional sign (green board) — stay in TRACKING ─────────────
+        if is_directional_sign:
+            # Update the directional gap timer regardless of state.
+            now = time.time()
+
+            # If the board disappeared and reappeared it's a new board — reset
+            # pending_direction so the fresh sign can be locked.
+            if not self.dir_sign_visible and self.dir_sign_gap_open:
+                self.pending_direction = None
+                self.dir_sign_gap_open = False
+                self.get_logger().info(
+                    f"[SIGN] New green board after gap — direction reset, locking '{sign}'."
                 )
 
-            # Refresh the ZONE_APPROACH timeout clock.
-            self.last_sign_time = time.time()
-            self.sign_visible   = True
+            self.dir_sign_visible = True
+            self._last_dir_sign_time = now
 
-            # Store direction only on first detection (don't overwrite mid-turn).
-            if is_directional_sign and self.pending_direction is None:
+            if self.pending_direction is None:
                 self.pending_direction = sign
                 self.get_logger().info(
                     f"[SIGN] Pending direction set to '{sign}' — "
                     "PID will bias toward this side through the junction."
                 )
+            return  # directional signs never trigger ZONE_APPROACH
+
+        # ── Location sign (A/B/C/X/Y/Z) — enter ZONE_APPROACH ────────────
+        if self.current_state != State.ZONE_APPROACH:
+            self._transition(
+                State.ZONE_APPROACH,
+                f"Location sign '{sign}' seen — approaching target."
+            )
+
+        self.last_sign_time   = time.time()
+        self.loc_sign_visible = True
 
     # ================================================================== #
     #  Callback: QR code → server handshake trigger                      #

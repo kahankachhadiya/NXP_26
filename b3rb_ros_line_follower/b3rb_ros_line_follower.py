@@ -38,21 +38,21 @@ TURN_BIAS_RIGHT    = -0.48
 
 # ── Boundary constraint ──────────────────────────────────────────────────────
 BOUNDARY_CORRECTION_TURN = 0.5
-BOUNDARY_SPEED_CAP       = 0.24
+BOUNDARY_SPEED_CAP       = 0.36   # was 0.24 → +50%
 
 # ── Speed constants ──────────────────────────────────────────────────────────
-NO_VECTOR_SPEED = 0.18
-STRAIGHT_SPEED  = 0.18
+NO_VECTOR_SPEED = 0.27   # was 0.18 → +50%
+STRAIGHT_SPEED  = 0.27   # was 0.18 → +50%
 
 # ── Obstacle avoidance (inline, no separate FSM state) ───────────────────────
-AVOIDANCE_SPEED     = 0.18
+AVOIDANCE_SPEED     = 0.27   # was 0.18 → +50%
 AVOIDANCE_TURN      = 0.6
 AVOIDANCE_THRESHOLD = 0.8   # metres — start avoidance
 
 # ── Target approach ───────────────────────────────────────────────────────────
 # Applied only when the target location sign has been seen (near destination).
-APPROACH_CREEP_THRESHOLD = 0.45   # metres — slow to creep speed
-APPROACH_STOP_THRESHOLD  = 0.22   # metres — stop for QR scan
+APPROACH_CREEP_THRESHOLD = 0.30   # was 0.45 — tighter creep zone
+APPROACH_STOP_THRESHOLD  = 0.12   # was 0.22 — stop closer to QR
 
 # ── Directional sign: how many consecutive frames of bias drop = turn done ───
 # Once the bias drops (both vectors straddle) for this many frames, the
@@ -521,7 +521,7 @@ class LineFollower(Node):
             return
 
         if min_dist <= APPROACH_CREEP_THRESHOLD and self.target_sign_seen:
-            self.target_speed = min(self.target_speed, 0.1)
+            self.target_speed = min(self.target_speed, 0.15)  # was 0.1 → +50%
             return
 
         if min_dist < AVOIDANCE_THRESHOLD:
@@ -608,7 +608,7 @@ class LineFollower(Node):
 
     def _navigate_to_parking(self):
         self.get_logger().info("[PARK] Parking — driving straight 3 s.")
-        self.target_speed = 0.3
+        self.target_speed = 0.45  # was 0.3 → +50%
         self.target_turn  = 0.0
         self._parking_timer = self.create_timer(3.0, self._finish_parking)
 

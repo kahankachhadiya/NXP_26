@@ -184,6 +184,12 @@ class LineFollower(Node):
         # ── ZONE_APPROACH timeout ──────────────────────────────────────────
         self.last_sign_time = None
 
+        # ── Sign visibility tracking ───────────────────────────────────────
+        # True while sign detections are arriving. Flips to False after
+        # ZONE_APPROACH_TIMEOUT with no detection. TRACKING is only entered
+        # once BOTH this is False AND both edge vectors are visible.
+        self.sign_visible = False
+
         # ── Throttle counters for high-frequency callbacks ─────────────────
         self._pid_log_counter   = 0
         self._lidar_log_counter = 0
@@ -279,9 +285,10 @@ class LineFollower(Node):
         old = self.active_target
         self.active_target = new_target
         sign = TARGET_SIGN_MAP.get(new_target, "UNKNOWN")
-        self.integral       = 0.0
-        self.prev_error     = 0.0
+        self.integral          = 0.0
+        self.prev_error        = 0.0
         self.pending_direction = None   # new target = fresh directional state
+        self.sign_visible      = False  # fresh sign tracking for new waypoint
         self.get_logger().info(
             f"[MISSION] Target updated: '{old}' → '{new_target}' "
             f"(look for sign '{sign}' / QR containing '{new_target}')."
@@ -331,17 +338,16 @@ class LineFollower(Node):
                 # Still avoiding — let publish_drive_commands send avoidance cmds.
                 return
 
-        # ── ZONE_APPROACH timeout check ────────────────────────────────
+        # ── ZONE_APPROACH: mark sign as gone after timeout ────────────────
         if (self.current_state == State.ZONE_APPROACH
                 and self.last_sign_time is not None
                 and time.time() - self.last_sign_time > ZONE_APPROACH_TIMEOUT):
-            self._transition(
-                State.TRACKING,
-                f"No sign seen for {ZONE_APPROACH_TIMEOUT}s — reverting to full speed."
-            )
-            # Clear pending direction only if the turn has had enough time to
-            # complete. If we're timing out it means the junction was passed.
-            self.pending_direction = None
+            if self.sign_visible:
+                self.sign_visible = False
+                self.get_logger().info(
+                    "[ZONE] Sign disappeared — waiting for both edge vectors "
+                    "before returning to TRACKING."
+                )
 
         # ── Directional bias for this frame ───────────────────────────
         if self.pending_direction == 'Left':
@@ -397,6 +403,15 @@ class LineFollower(Node):
         x1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
         x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
         centroid_x = (x1 + x2) / 2.0
+
+        # ── Gate: only return to TRACKING when sign is gone AND on track ──
+        if (self.current_state == State.ZONE_APPROACH
+                and not self.sign_visible):
+            self._transition(
+                State.TRACKING,
+                "Sign gone and both edge vectors visible — junction complete."
+            )
+            self.pending_direction = None
 
         # Normalised lateral error + directional bias.
         error = (centroid_x - half_width) / half_width + bias
@@ -521,6 +536,7 @@ class LineFollower(Node):
 
             # Refresh the ZONE_APPROACH timeout clock.
             self.last_sign_time = time.time()
+            self.sign_visible   = True
 
             # Store direction only on first detection (don't overwrite mid-turn).
             if is_directional_sign and self.pending_direction is None:

@@ -52,12 +52,17 @@ AVOIDANCE_TURN  = 0.6    # turn magnitude — direction chosen from LIDAR cleara
 ZONE_APPROACH_TIMEOUT = 5.0   # seconds without a new sign → revert to TRACKING
 
 # ── PID gains ───────────────────────────────────────────────────────────────
-KP = 0.35
+KP = 0.2
 KI = 0.0
-KD = 0.35
+KD = 0.1
 
 # ── Steering deadband ────────────────────────────────────────────────────────
-STEERING_DEADBAND = 0.05   # normalised errors below this are zeroed (reduces wobble)
+STEERING_DEADBAND = 0.1   # normalised errors below this are zeroed (reduces wobble)
+
+# ── Speed control ────────────────────────────────────────────────────────────
+# Speed only reduces when |turn| exceeds this — buggy holds full speed on
+# minor corrections, preventing speed-induced steering oscillation.
+SPEED_REDUCTION_THRESHOLD = 0.3
 
 
 # ── FSM States ───────────────────────────────────────────────────────────────
@@ -389,10 +394,11 @@ class LineFollower(Node):
         self.prev_error  = error
 
         self.target_turn  = max(TURN_MIN, min(TURN_MAX, -u))
-        self.target_speed = max(
-            SPEED_MIN,
-            min(speed_cap, speed_cap * (1.0 - abs(self.target_turn)))
-        )
+
+        # Speed: hold full speed_cap for small turns; only reduce on large turns.
+        excess = max(0.0, abs(self.target_turn) - SPEED_REDUCTION_THRESHOLD)
+        scale  = 1.0 - excess / (1.0 - SPEED_REDUCTION_THRESHOLD + 1e-6)
+        self.target_speed = max(SPEED_MIN, min(speed_cap, speed_cap * scale))
 
         # Throttle PID log to once every 30 callbacks.
         self._pid_log_counter += 1

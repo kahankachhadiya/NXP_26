@@ -60,15 +60,15 @@ APPROACH_STOP_THRESHOLD  = 0.12   # was 0.22 — stop closer to QR
 TURN_DONE_FRAMES = 5
 
 # ── PID gains ───────────────────────────────────────────────────────────────
-KP = 0.25
+KP = 0.40   # was 0.25 — stronger proportional correction at higher speed
 KI = 0.0
-KD = 0.08
+KD = 0.14   # was 0.08 — more damping to prevent oscillation / overshoot
 
 # ── Boundary proximity steering ──────────────────────────────────────────────
-BOUNDARY_ZONE = 0.35
+BOUNDARY_ZONE = 0.55   # was 0.35 — start correcting earlier, further from edge
 
 # ── Speed control ────────────────────────────────────────────────────────────
-SPEED_REDUCTION_THRESHOLD = 0.3
+SPEED_REDUCTION_THRESHOLD = 0.15   # was 0.3 — cut speed sooner when turning
 
 
 # ── FSM States ───────────────────────────────────────────────────────────────
@@ -492,9 +492,11 @@ class LineFollower(Node):
 
         self.target_turn = max(TURN_MIN, min(TURN_MAX, -u))
 
-        excess = max(0.0, abs(self.target_turn) - SPEED_REDUCTION_THRESHOLD)
-        scale  = 1.0 - excess / (1.0 - SPEED_REDUCTION_THRESHOLD + 1e-6)
-        self.target_speed = max(SPEED_MIN, min(SPEED_MAX, SPEED_MAX * scale))
+        # Quadratic speed-turn coupling: speed drops as turn² so the buggy
+        # slows hard mid-corner but stays fast on straights.
+        turn_ratio = abs(self.target_turn)   # 0.0 (straight) → 1.0 (full lock)
+        scale = max(0.0, 1.0 - turn_ratio ** 2)
+        self.target_speed = max(SPEED_MIN, min(SPEED_MAX, STRAIGHT_SPEED + (SPEED_MAX - STRAIGHT_SPEED) * scale))
 
         self._pid_log_counter += 1
         if self._pid_log_counter >= 30:

@@ -56,7 +56,9 @@ APPROACH_CREEP_THRESHOLD = 0.6   # metres — start slowing down
 APPROACH_STOP_THRESHOLD  = 0.35  # metres — stop and wait for QR scan
 
 # ── ZONE_APPROACH auto-expiry ────────────────────────────────────────────────
-ZONE_APPROACH_TIMEOUT = 5.0   # seconds without a new sign → revert to TRACKING
+ZONE_APPROACH_TIMEOUT   = 5.0   # seconds without a new sign → mark sign as gone
+STRADDLE_CONFIRM_FRAMES = 8     # consecutive frames with vectors on both sides → TRACKING
+STRADDLE_FORCE_TIMEOUT  = 8.0   # seconds after sign gone → force TRACKING regardless
 
 # ── PID gains ───────────────────────────────────────────────────────────────
 KP = 0.25
@@ -202,6 +204,16 @@ class LineFollower(Node):
         # once BOTH this is False AND both edge vectors are visible.
         self.sign_visible = False
 
+        # ── Stable straddle counter ────────────────────────────────────────
+        # Counts consecutive frames where vector_1 and vector_2 are on
+        # opposite sides of image centre (one left, one right = on new road).
+        # TRACKING is entered when this reaches STRADDLE_CONFIRM_FRAMES.
+        self._straddle_count = 0
+
+        # Hard fallback: if sign gone but straddle never confirmed within this
+        # many seconds, force TRACKING anyway to avoid permanent ZONE_APPROACH.
+        self._sign_gone_time = None
+
         # ── Throttle counters for high-frequency callbacks ─────────────────
         self._pid_log_counter   = 0
         self._lidar_log_counter = 0
@@ -295,8 +307,10 @@ class LineFollower(Node):
         sign = TARGET_SIGN_MAP.get(new_target, "UNKNOWN")
         self.integral          = 0.0
         self.prev_error        = 0.0
-        self.pending_direction = None   # new target = fresh directional state
-        self.sign_visible      = False  # fresh sign tracking for new waypoint
+        self.pending_direction = None
+        self.sign_visible      = False
+        self._straddle_count   = 0
+        self._sign_gone_time   = None
         self.get_logger().info(
             f"[MISSION] Target updated: '{old}' → '{new_target}' "
             f"(look for sign '{sign}' / QR containing '{new_target}')."
@@ -380,11 +394,23 @@ class LineFollower(Node):
                 and self.last_sign_time is not None
                 and time.time() - self.last_sign_time > ZONE_APPROACH_TIMEOUT):
             if self.sign_visible:
-                self.sign_visible = False
+                self.sign_visible    = False
+                self._sign_gone_time = time.time()
+                self._straddle_count = 0
                 self.get_logger().info(
-                    "[ZONE] Sign disappeared — waiting for both edge vectors "
+                    "[ZONE] Sign disappeared — waiting for stable straddle "
                     "before returning to TRACKING."
                 )
+            # Hard fallback: straddle never confirmed → force TRACKING
+            if (self._sign_gone_time is not None
+                    and time.time() - self._sign_gone_time > STRADDLE_FORCE_TIMEOUT):
+                self.get_logger().info(
+                    "[ZONE] Straddle timeout — forcing TRACKING."
+                )
+                self._transition(State.TRACKING, "Straddle force timeout.")
+                self.pending_direction = None
+                self._straddle_count   = 0
+                self._sign_gone_time   = None
 
         # ── Directional bias for this frame ───────────────────────────
         if self.pending_direction == 'Left':
@@ -435,30 +461,31 @@ class LineFollower(Node):
             return
 
         # ════════════════════════════════════════════════════════════════
-        #  CASE 2: Both vectors visible — check they are on opposite sides
+        #  CASE 2: Both vectors visible — check nearest on each side
         # ════════════════════════════════════════════════════════════════
         x1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
         x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
         centroid_x = (x1 + x2) / 2.0
 
-        # Confirm vectors are on opposite sides of centre (left AND right boundary).
-        # If both are on the same side the buggy hasn't fully entered the new lane.
-        v1_left = x1 < half_width
-        v2_left = x2 < half_width
-        vectors_straddling = (v1_left != v2_left)   # one left, one right
+        # Straddle check: one vector left of centre, one right.
+        vectors_straddling = (x1 < half_width) != (x2 < half_width)
 
-        # ── Gate: return to TRACKING only when sign gone AND straddling ──
-        if (self.current_state == State.ZONE_APPROACH
-                and not self.sign_visible
-                and vectors_straddling):
-            self._transition(
-                State.TRACKING,
-                "Sign gone and vectors on both sides — junction complete."
-            )
-            self.pending_direction = None
+        if self.current_state == State.ZONE_APPROACH and not self.sign_visible:
+            if vectors_straddling:
+                self._straddle_count += 1
+                if self._straddle_count >= STRADDLE_CONFIRM_FRAMES:
+                    self._transition(
+                        State.TRACKING,
+                        f"Straddle confirmed ({STRADDLE_CONFIRM_FRAMES} frames) — junction complete."
+                    )
+                    self.pending_direction = None
+                    self._straddle_count   = 0
+                    self._sign_gone_time   = None
+            else:
+                # Vectors still on same side — reset counter, turn not done yet.
+                self._straddle_count = 0
 
-        # Once both vectors are on opposite sides the buggy is centred on the
-        # new road — drop the directional bias to stop wobbling on the straight.
+        # Drop bias once straddling — buggy is centred on the new road.
         if vectors_straddling:
             bias = 0.0
 

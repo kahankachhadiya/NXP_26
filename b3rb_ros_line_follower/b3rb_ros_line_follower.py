@@ -52,16 +52,21 @@ AVOIDANCE_TURN  = 0.6    # turn magnitude — direction chosen from LIDAR cleara
 ZONE_APPROACH_TIMEOUT = 5.0   # seconds without a new sign → revert to TRACKING
 
 # ── PID gains ───────────────────────────────────────────────────────────────
-KP = 0.2
+KP = 0.25
 KI = 0.0
-KD = 0.1
+KD = 0.08
 
-# ── Steering deadband ────────────────────────────────────────────────────────
-STEERING_DEADBAND = 0.1   # normalised errors below this are zeroed (reduces wobble)
+# ── Boundary proximity steering ──────────────────────────────────────────────
+# The buggy does NOT try to stay at centre. It only corrects when the centroid
+# drifts into the danger zone near a boundary (within BOUNDARY_ZONE of either
+# edge). Inside the safe zone the error is zeroed — buggy goes straight.
+#
+# BOUNDARY_ZONE: fraction of half-width from each edge that triggers correction.
+#   e.g. 0.35 means correction starts when centroid is within 35% of half-width
+#   from either boundary line.  The middle 30% of the road is a free zone.
+BOUNDARY_ZONE = 0.35
 
 # ── Speed control ────────────────────────────────────────────────────────────
-# Speed only reduces when |turn| exceeds this — buggy holds full speed on
-# minor corrections, preventing speed-induced steering oscillation.
 SPEED_REDUCTION_THRESHOLD = 0.3
 
 
@@ -450,12 +455,25 @@ class LineFollower(Node):
         if vectors_straddling:
             bias = 0.0
 
-        # Normalised lateral error + directional bias.
-        error = (centroid_x - half_width) / half_width + bias
+        # Boundary-proximity error:
+        # - Compute normalised centroid position: -1 = left edge, +1 = right edge
+        # - Only generate an error when centroid is inside BOUNDARY_ZONE from
+        #   either edge. Inside the safe zone error = 0 → buggy goes straight.
+        norm_pos = (centroid_x - half_width) / half_width  # -1..+1
+        safe_limit = 1.0 - BOUNDARY_ZONE
 
-        # Deadband — ignore tiny errors to suppress straight-road wobble.
-        if abs(error) < STEERING_DEADBAND:
+        if norm_pos > safe_limit:
+            # Too close to right boundary — push left (negative error → positive turn)
+            error = norm_pos - safe_limit
+        elif norm_pos < -safe_limit:
+            # Too close to left boundary — push right (positive error → negative turn)
+            error = norm_pos + safe_limit
+        else:
+            # Inside safe zone — no correction needed, go straight
             error = 0.0
+
+        # Add directional bias on top (only non-zero during junction turns).
+        error += bias
 
         self.integral   += error
         derivative       = error - self.prev_error

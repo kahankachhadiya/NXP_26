@@ -243,11 +243,16 @@ class LineFollower(Node):
             + (f"| reason: {reason}" if reason else "")
             + " ***"
         )
-        # Clear pending direction whenever we leave ZONE_APPROACH.
+        # Reset PID integral on every TRACKING entry.
         if new_state == State.TRACKING:
-            self.pending_direction = None
             self.integral   = 0.0
             self.prev_error = 0.0
+        # NOTE: pending_direction is intentionally NOT cleared here.
+        # It must survive OBSTACLE_AVOIDANCE interruptions so the turn
+        # is still executed when the buggy reaches the junction.
+        # It is only cleared explicitly in two places:
+        #   1. sign_board_callback when a new directional sign overwrites it.
+        #   2. server_communication_callback when a new mission target is set.
 
     # ================================================================== #
     #  Helper: send message to server                                     #
@@ -270,12 +275,13 @@ class LineFollower(Node):
     # ================================================================== #
 
     def _set_active_target(self, new_target):
-        """Update active_target, log thoroughly, and reset PID integral."""
+        """Update active_target and reset PID integral."""
         old = self.active_target
         self.active_target = new_target
         sign = TARGET_SIGN_MAP.get(new_target, "UNKNOWN")
-        self.integral  = 0.0
-        self.prev_error = 0.0
+        self.integral       = 0.0
+        self.prev_error     = 0.0
+        self.pending_direction = None   # new target = fresh directional state
         self.get_logger().info(
             f"[MISSION] Target updated: '{old}' → '{new_target}' "
             f"(look for sign '{sign}' / QR containing '{new_target}')."
@@ -308,10 +314,19 @@ class LineFollower(Node):
         # ── If avoiding and both lane lines reappear → back inside track ──
         if self.current_state == State.OBSTACLE_AVOIDANCE:
             if message.vector_count == 2:
-                self._transition(
-                    State.TRACKING,
-                    "Both edge vectors visible — back inside track after avoidance."
-                )
+                # If we still have a pending turn, re-enter ZONE_APPROACH to
+                # execute it. Otherwise resume normal TRACKING.
+                if self.pending_direction is not None:
+                    self._transition(
+                        State.ZONE_APPROACH,
+                        "Back inside track after avoidance — resuming pending turn."
+                    )
+                    self.last_sign_time = time.time()  # reset timeout
+                else:
+                    self._transition(
+                        State.TRACKING,
+                        "Both edge vectors visible — back inside track after avoidance."
+                    )
             else:
                 # Still avoiding — let publish_drive_commands send avoidance cmds.
                 return
@@ -324,6 +339,8 @@ class LineFollower(Node):
                 State.TRACKING,
                 f"No sign seen for {ZONE_APPROACH_TIMEOUT}s — reverting to full speed."
             )
+            # Clear pending direction only if the turn has had enough time to
+            # complete. If we're timing out it means the junction was passed.
             self.pending_direction = None
 
         # ── Directional bias for this frame ───────────────────────────
@@ -483,7 +500,7 @@ class LineFollower(Node):
           forward in the pending_direction until the line reappears.
         - Signs irrelevant to the current target are ignored.
         """
-        if self.current_state == State.MISSION_COMPLETE:
+        if self.current_state in (State.MISSION_COMPLETE, State.OBSTACLE_AVOIDANCE):
             return
 
         sign = message.data

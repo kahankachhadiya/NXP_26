@@ -44,9 +44,16 @@ BOUNDARY_SPEED_CAP       = 0.2   # speed cap during boundary correction
 ZONE_SPEED_FRACTION = 0.4    # fraction of SPEED_MAX in ZONE_APPROACH
 NO_VECTOR_SPEED     = 0.15   # creep speed at a known junction gap
 
-# ── Obstacle avoidance ───────────────────────────────────────────────────────
-AVOIDANCE_SPEED = 0.15   # forward speed while steering around obstacle
-AVOIDANCE_TURN  = 0.6    # turn magnitude — direction chosen from LIDAR clearance
+# ── Obstacle avoidance (TRACKING state) ─────────────────────────────────────
+AVOIDANCE_SPEED    = 0.15   # forward speed while steering around obstacle
+AVOIDANCE_TURN     = 0.6    # turn magnitude — direction chosen from LIDAR clearance
+AVOIDANCE_THRESHOLD = 0.8   # metres — triggers avoidance in TRACKING
+
+# ── Target approach (ZONE_APPROACH state) ────────────────────────────────────
+# In ZONE_APPROACH the building/patient is the destination, not an obstacle.
+# Creep forward slowly and stop very close so the QR code is in scan range.
+APPROACH_CREEP_THRESHOLD = 0.6   # metres — start slowing down
+APPROACH_STOP_THRESHOLD  = 0.35  # metres — stop and wait for QR scan
 
 # ── ZONE_APPROACH auto-expiry ────────────────────────────────────────────────
 ZONE_APPROACH_TIMEOUT = 5.0   # seconds without a new sign → revert to TRACKING
@@ -503,55 +510,69 @@ class LineFollower(Node):
 
     def lidar_callback(self, message):
         """
-        Monitor the forward sector for obstacles.
+        LIDAR handler — behaviour depends on current state:
 
-        On obstacle detection: compute which side has more clearance from the
-        LIDAR scan, set avoidance_turn_value toward the clearer side, and enter
-        OBSTACLE_AVOIDANCE.  The buggy drives slowly while turning until
-        edge_vectors_callback sees both lane lines again.
+        ZONE_APPROACH (target building ahead):
+          - > APPROACH_CREEP_THRESHOLD : normal PID speed (edge vectors control)
+          - APPROACH_STOP..CREEP       : slow to 0.1 m/s creep toward target
+          - <= APPROACH_STOP_THRESHOLD : stop — close enough for QR scan
+          This ensures the buggy stops within QR camera range of the building.
 
-        Ignores obstacles during SERVER_HANDSHAKE and MISSION_COMPLETE.
+        TRACKING (unknown obstacle):
+          - < AVOIDANCE_THRESHOLD : steer around it using clearance comparison.
+
+        Ignored during SERVER_HANDSHAKE, MISSION_COMPLETE, OBSTACLE_AVOIDANCE.
         """
-        if self.current_state in (State.SERVER_HANDSHAKE, State.MISSION_COMPLETE):
+        if self.current_state in (State.SERVER_HANDSHAKE, State.MISSION_COMPLETE,
+                                   State.OBSTACLE_AVOIDANCE):
             return
 
         N = len(message.ranges)
-
-        # Forward sector — centre ~22% of the scan arc.
         front_start = int(N * 7 / 18)
         front_end   = int(N * 11 / 18)
-        front       = message.ranges[front_start:front_end]
+        front        = message.ranges[front_start:front_end]
         finite_front = [r for r in front if math.isfinite(r)]
-        min_dist = min(finite_front) if finite_front else math.inf
+        min_dist     = min(finite_front) if finite_front else math.inf
 
-        if min_dist < 0.8:
+        # ── ZONE_APPROACH: controlled creep-and-stop toward target ────────
+        if self.current_state == State.ZONE_APPROACH:
+            if min_dist <= APPROACH_STOP_THRESHOLD:
+                # Close enough — stop and let QR scanner work.
+                if self.target_speed > 0.0:
+                    self.target_speed = 0.0
+                    self.target_turn  = 0.0
+                    self.get_logger().info(
+                        f"[APPROACH] Stopped at {min_dist:.2f} m — waiting for QR scan."
+                    )
+            elif min_dist <= APPROACH_CREEP_THRESHOLD:
+                # In creep zone — slow to 0.1 regardless of PID output.
+                self.target_speed = 0.1
+            return  # don't trigger avoidance in ZONE_APPROACH
+
+        # ── TRACKING: obstacle avoidance ──────────────────────────────────
+        if min_dist < AVOIDANCE_THRESHOLD:
             if self.current_state != State.OBSTACLE_AVOIDANCE:
-                # Decide avoidance direction: compare clearance on left vs right.
-                left_ranges  = [r for r in message.ranges[:front_start]   if math.isfinite(r)]
-                right_ranges = [r for r in message.ranges[front_end:]     if math.isfinite(r)]
+                left_ranges  = [r for r in message.ranges[:front_start] if math.isfinite(r)]
+                right_ranges = [r for r in message.ranges[front_end:]   if math.isfinite(r)]
                 left_clear   = sum(left_ranges)  / len(left_ranges)  if left_ranges  else 0.0
                 right_clear  = sum(right_ranges) / len(right_ranges) if right_ranges else 0.0
 
-                # Steer toward the side with more average clearance.
                 if left_clear >= right_clear:
-                    self.avoidance_turn_value =  AVOIDANCE_TURN   # steer left
+                    self.avoidance_turn_value =  AVOIDANCE_TURN
                     side = "LEFT"
                 else:
-                    self.avoidance_turn_value = -AVOIDANCE_TURN   # steer right
+                    self.avoidance_turn_value = -AVOIDANCE_TURN
                     side = "RIGHT"
 
                 self._transition(
                     State.OBSTACLE_AVOIDANCE,
                     f"Obstacle at {min_dist:.2f} m — steering {side} to avoid."
                 )
-                # Seed target values — edge_vectors_callback will override each frame.
                 self.target_speed = AVOIDANCE_SPEED
                 self.target_turn  = self.avoidance_turn_value
 
         elif self.current_state == State.OBSTACLE_AVOIDANCE:
-            # Obstacle cleared from front — but stay in OBSTACLE_AVOIDANCE
-            # until edge_vectors_callback confirms we are back inside the track.
-            pass
+            pass  # stay in avoidance until edge vectors confirm we're back on track
 
     # ================================================================== #
     #  Callback: Sign board → intersection navigation                    #

@@ -225,10 +225,6 @@ class LineFollower(Node):
         if self.current_state in (State.MISSION_COMPLETE, State.SERVER_HANDSHAKE):
             speed = 0.0
             turn  = 0.0
-        elif self.current_state == State.OBSTACLE_AVOIDANCE:
-            # Drive slowly while steering around the obstacle.
-            speed = AVOIDANCE_SPEED
-            turn  = self.avoidance_turn_value
         else:
             turn  = max(TURN_MIN,  min(TURN_MAX,  self.target_turn))
             speed = max(SPEED_MIN, min(SPEED_MAX, self.target_speed))
@@ -318,24 +314,39 @@ class LineFollower(Node):
                                        State.OBSTACLE_AVOIDANCE):
             return
 
-        # ── If avoiding and both lane lines reappear → back inside track ──
+        # ── If avoiding: run full boundary logic, don't use fixed avoidance ──
+        # The avoidance_turn_value set by LIDAR is used as a bias preference,
+        # but edge vectors are the hard constraint — they always win.
         if self.current_state == State.OBSTACLE_AVOIDANCE:
             if message.vector_count == 2:
-                # If we still have a pending turn, re-enter ZONE_APPROACH to
-                # execute it. Otherwise resume normal TRACKING.
+                # Both lines visible — obstacle cleared and back inside track.
                 if self.pending_direction is not None:
                     self._transition(
                         State.ZONE_APPROACH,
                         "Back inside track after avoidance — resuming pending turn."
                     )
-                    self.last_sign_time = time.time()  # reset timeout
+                    self.last_sign_time = time.time()
                 else:
                     self._transition(
                         State.TRACKING,
                         "Both edge vectors visible — back inside track after avoidance."
                     )
+                # Fall through to normal PID below.
+            elif message.vector_count == 1:
+                # One boundary visible — steer away from it (boundary wins over
+                # avoidance direction).
+                half_width = float(message.image_width) / 2.0
+                vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+                if vec_x < half_width:
+                    self.target_turn = -BOUNDARY_CORRECTION_TURN  # left boundary → steer right
+                else:
+                    self.target_turn =  BOUNDARY_CORRECTION_TURN  # right boundary → steer left
+                self.target_speed = AVOIDANCE_SPEED
+                return
             else:
-                # Still avoiding — let publish_drive_commands send avoidance cmds.
+                # No vectors — creep in avoidance direction (open space).
+                self.target_speed = AVOIDANCE_SPEED
+                self.target_turn  = self.avoidance_turn_value
                 return
 
         # ── ZONE_APPROACH: mark sign as gone after timeout ────────────────
@@ -489,6 +500,9 @@ class LineFollower(Node):
                     State.OBSTACLE_AVOIDANCE,
                     f"Obstacle at {min_dist:.2f} m — steering {side} to avoid."
                 )
+                # Seed target values — edge_vectors_callback will override each frame.
+                self.target_speed = AVOIDANCE_SPEED
+                self.target_turn  = self.avoidance_turn_value
 
         elif self.current_state == State.OBSTACLE_AVOIDANCE:
             # Obstacle cleared from front — but stay in OBSTACLE_AVOIDANCE

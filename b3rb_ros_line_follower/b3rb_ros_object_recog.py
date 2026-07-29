@@ -69,13 +69,29 @@ class ObjectRecognizer(Node):
                 self.net = cv2.dnn.readNetFromONNX(model_path)
                 self.get_logger().info("[INIT] ONNX model loaded successfully.")
 
-                # Attempt CUDA acceleration; fall back to CPU transparently.
-                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                self.get_logger().info(
-                    "[INIT] Backend set to CUDA. "
-                    "(If no CUDA GPU is present, OpenCV will silently fall back to CPU.)"
-                )
+                # Attempt CUDA acceleration; fall back to CPU if unavailable.
+                cuda_available = False
+                try:
+                    self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                    self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                    # Probe with a tiny dummy blob to confirm CUDA actually works.
+                    dummy = cv2.dnn.blobFromImage(
+                        np.zeros((8, 8, 3), dtype=np.uint8),
+                        scalefactor=1.0 / 255.0,
+                        size=(8, 8),
+                        swapRB=True,
+                        crop=False,
+                    )
+                    self.net.setInput(dummy)
+                    self.net.forward()
+                    cuda_available = True
+                    self.get_logger().info("[INIT] CUDA backend confirmed — using GPU inference.")
+                except Exception:
+                    # CUDA not available or not working; fall back to CPU.
+                    self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+                    self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                    self.get_logger().info("[INIT] CUDA unavailable — falling back to CPU inference.")
+
             except Exception as exc:
                 self.get_logger().error(
                     f"[INIT] Failed to load DNN model: {exc}. "
@@ -104,6 +120,9 @@ class ObjectRecognizer(Node):
 
         # Frame counter — reduces log spam (log every 30th frame at INFO level).
         self._frame_count = 0
+
+        # Track last published sign to avoid duplicate log lines.
+        self._last_sign = None
 
         self.get_logger().info(
             "[INIT] ObjectRecognizer node ready. "
@@ -138,16 +157,16 @@ class ObjectRecognizer(Node):
             msg = String()
             msg.data = sign_label
             self.publisher_sign.publish(msg)
-            self.get_logger().info(
-                f"[SIGN] *** DETECTED: '{sign_label}' "
-                f"(confidence={max_score:.3f}) — published to /sign_board_detection ***"
-            )
-        else:
-            if self._frame_count % 30 == 0:
+            # Only log when the detected sign changes.
+            if sign_label != self._last_sign:
                 self.get_logger().info(
-                    f"[SIGN] No sign detected this frame "
-                    f"(best score={max_score:.3f} < threshold={CONFIDENCE_THRESHOLD})."
+                    f"[SIGN] DETECTED: '{sign_label}' (confidence={max_score:.3f})"
                 )
+                self._last_sign = sign_label
+        else:
+            if self._last_sign is not None:
+                self.get_logger().info("[SIGN] No sign in view.")
+                self._last_sign = None
 
     # ---------------------------------------------------------------------- #
     #  Inference logic                                                        #
@@ -164,17 +183,11 @@ class ObjectRecognizer(Node):
             max_score : highest confidence value found across all classes and anchors.
         """
         if image is None or self.net is None:
-            self.get_logger().warn(
-                "[INFER] Skipping inference — image is None or model not loaded."
-            )
             return None, 0.0
 
         # 1. Crop to top 50% — sign boards are above the track surface.
         h = image.shape[0]
         cropped = image[0 : h // 2, :, :]
-        self.get_logger().info(
-            f"[INFER] Cropped to top 50%: {cropped.shape[1]}x{cropped.shape[0]} px."
-        )
 
         # 2. Build normalized blob: scale=1/255, size=512x512, swap BGR→RGB, no crop.
         blob = cv2.dnn.blobFromImage(
@@ -190,45 +203,29 @@ class ObjectRecognizer(Node):
         try:
             preds = self.net.forward()
         except Exception as exc:
-            self.get_logger().error(f"[INFER] Forward pass failed: {exc}")
+            # Only log forward-pass errors once per 30 frames to avoid spam.
+            if self._frame_count % 30 == 0:
+                self.get_logger().error(f"[INFER] Forward pass failed: {exc}")
             return None, 0.0
 
-        self.get_logger().info(
-            f"[INFER] Raw output shape: {preds.shape}. "
-            "Extracting class scores from rows 4-12."
-        )
-
         if preds.shape[1] < 13:
-            self.get_logger().error(
-                f"[INFER] Unexpected output shape {preds.shape} — expected (1, 13, N). "
-                "Cannot extract class scores."
-            )
+            if self._frame_count % 30 == 0:
+                self.get_logger().error(
+                    f"[INFER] Unexpected output shape {preds.shape} — expected (1, 13, N)."
+                )
             return None, 0.0
 
         # 4. Class confidence matrix: skip first 4 rows (bbox), take rows 4-12 → shape (9, N).
         scores_matrix = preds[0][4:, :]   # shape: (9, 5376)
 
         max_score = float(np.max(scores_matrix))
-        self.get_logger().info(
-            f"[INFER] Max confidence across all classes/anchors: {max_score:.4f}."
-        )
 
         if max_score >= CONFIDENCE_THRESHOLD:
-            # Find which class row and anchor column produced the max score.
-            class_idx, anchor_idx = np.unravel_index(
+            class_idx, _ = np.unravel_index(
                 np.argmax(scores_matrix), scores_matrix.shape
             )
-            label = CLASS_NAMES[class_idx]
-            self.get_logger().info(
-                f"[INFER] Threshold PASSED → class_idx={class_idx}, "
-                f"label='{label}', anchor={anchor_idx}, score={max_score:.4f}."
-            )
-            return label, max_score
+            return CLASS_NAMES[class_idx], max_score
 
-        self.get_logger().info(
-            f"[INFER] Threshold NOT met ({max_score:.4f} < {CONFIDENCE_THRESHOLD}). "
-            "No sign published."
-        )
         return None, max_score
 
 

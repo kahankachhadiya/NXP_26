@@ -109,6 +109,9 @@ class EdgeVectorsPublisher(Node):
         # Frame counter for throttled logging.
         self._frame_count = 0
 
+        # Track last vector count to only log when it changes.
+        self._last_vector_count = -1
+
         self.get_logger().info(
             "[INIT] EdgeVectorsPublisher ready. "
             f"HSV black range: {LOWER_BLACK.tolist()} → {UPPER_BLACK.tolist()}. "
@@ -163,12 +166,8 @@ class EdgeVectorsPublisher(Node):
         """
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
-        self.get_logger().info(
-            f"[CONTOUR] Found {len(contours)} raw contour(s) in cropped region."
-        )
-
         vectors = []
-        for i, contour in enumerate(contours):
+        for contour in contours:
             coords = contour[:, 0, :]          # shape: (N, 2) — (x, y) pairs
 
             min_y = int(np.min(coords[:, 1]))
@@ -185,10 +184,6 @@ class EdgeVectorsPublisher(Node):
             ))
 
             if magnitude <= VECTOR_MAGNITUDE_MINIMUM:
-                self.get_logger().info(
-                    f"[CONTOUR] Contour #{i} discarded — magnitude={magnitude:.2f} "
-                    f"< min={VECTOR_MAGNITUDE_MINIMUM}."
-                )
                 continue
 
             # Distance from the bottom-centre of the crop window (buggy's viewpoint).
@@ -202,12 +197,6 @@ class EdgeVectorsPublisher(Node):
                 top_pt[0] = int(np.max(min_y_pts[:, 0]))
             else:
                 bottom_pt[0] = int(np.max(max_y_pts[:, 0]))
-
-            self.get_logger().info(
-                f"[CONTOUR] Contour #{i} accepted — "
-                f"top={top_pt}, bottom={bottom_pt}, "
-                f"magnitude={magnitude:.2f}, distance={distance:.2f}, angle={math.degrees(angle):.1f}°."
-            )
 
             vectors.append([top_pt, bottom_pt, distance])
 
@@ -244,26 +233,14 @@ class EdgeVectorsPublisher(Node):
         self.lower_image_height = int(self.image_height * VECTOR_IMAGE_HEIGHT_PERCENTAGE)
         self.upper_image_height = self.image_height - self.lower_image_height
 
-        self.get_logger().info(
-            f"[PIPELINE] Image {self.image_width}x{self.image_height}. "
-            f"Crop rows {self.upper_image_height}–{self.image_height} "
-            f"({self.lower_image_height}px tall)."
-        )
-
         # Step 1: Gaussian blur — reduces pixel noise before HSV conversion.
         blurred = cv2.GaussianBlur(image, (5, 5), 0)
-        self.get_logger().info("[PIPELINE] GaussianBlur (5×5) applied.")
 
         # Step 2: Convert to HSV.
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-        self.get_logger().info("[PIPELINE] Converted BGR → HSV.")
 
         # Step 3: Threshold — isolate black pixels.
         thresh = cv2.inRange(hsv, LOWER_BLACK, UPPER_BLACK)
-        black_pixel_count = int(np.sum(thresh > 0))
-        self.get_logger().info(
-            f"[PIPELINE] HSV inRange complete — {black_pixel_count} black pixels detected."
-        )
 
         # Step 4: Crop both images to the analysis strip near the buggy.
         thresh_cropped = thresh[self.upper_image_height:, :]
@@ -271,9 +248,6 @@ class EdgeVectorsPublisher(Node):
 
         # Step 5: Extract vectors from contours.
         vectors, debug_img = self.compute_vectors_from_image(image_cropped, thresh_cropped)
-        self.get_logger().info(
-            f"[PIPELINE] {len(vectors)} valid vector(s) extracted after contour processing."
-        )
 
         # Step 6: Sort by distance (closest to buggy first).
         vectors = sorted(vectors, key=lambda v: v[2])
@@ -283,18 +257,10 @@ class EdgeVectorsPublisher(Node):
         vectors_left   = [v for v in vectors if (v[0][0] + v[1][0]) / 2.0 <  half_width]
         vectors_right  = [v for v in vectors if (v[0][0] + v[1][0]) / 2.0 >= half_width]
 
-        self.get_logger().info(
-            f"[PIPELINE] Split → left={len(vectors_left)}, right={len(vectors_right)} vector(s)."
-        )
-
         final_vectors = []
-        side_labels   = ['LEFT', 'RIGHT']
 
-        for label, side_vectors in zip(side_labels, [vectors_left, vectors_right]):
+        for side_vectors in [vectors_left, vectors_right]:
             if not side_vectors:
-                self.get_logger().info(
-                    f"[PIPELINE] No {label} vector found — boundary missing."
-                )
                 continue
 
             best = side_vectors[0]
@@ -302,20 +268,11 @@ class EdgeVectorsPublisher(Node):
             # Draw the selected lane boundary in green.
             cv2.line(debug_img, tuple(best[0]), tuple(best[1]), GREEN_COLOR, 2)
 
-            self.get_logger().info(
-                f"[PIPELINE] Best {label} vector: "
-                f"top={best[0]}, bottom={best[1]}, dist={best[2]:.2f}."
-            )
-
             # Remap y-coordinates from cropped to full image space.
             best[0][1] += self.upper_image_height
             best[1][1] += self.upper_image_height
 
             final_vectors.append(best[:2])
-
-        self.get_logger().info(
-            f"[PIPELINE] Publishing {len(final_vectors)} edge vector(s)."
-        )
 
         # Publish debug images (viewable in Foxglove / RViz).
         self.publish_debug_image(self.publisher_thresh_image, thresh_cropped)
@@ -357,11 +314,6 @@ class EdgeVectorsPublisher(Node):
             msg.vector_1[1].x = float(vectors[0][1][0])
             msg.vector_1[1].y = float(vectors[0][1][1])
             msg.vector_count += 1
-            self.get_logger().info(
-                f"[PUBLISH] Vector 1 (LEFT boundary): "
-                f"({msg.vector_1[0].x:.1f},{msg.vector_1[0].y:.1f}) → "
-                f"({msg.vector_1[1].x:.1f},{msg.vector_1[1].y:.1f})."
-            )
 
         if len(vectors) > 1:
             msg.vector_2[0].x = float(vectors[1][0][0])
@@ -369,17 +321,18 @@ class EdgeVectorsPublisher(Node):
             msg.vector_2[1].x = float(vectors[1][1][0])
             msg.vector_2[1].y = float(vectors[1][1][1])
             msg.vector_count += 1
-            self.get_logger().info(
-                f"[PUBLISH] Vector 2 (RIGHT boundary): "
-                f"({msg.vector_2[0].x:.1f},{msg.vector_2[0].y:.1f}) → "
-                f"({msg.vector_2[1].x:.1f},{msg.vector_2[1].y:.1f})."
-            )
 
-        if msg.vector_count == 0:
-            self.get_logger().warn(
-                "[PUBLISH] No edge vectors detected this frame — "
-                "buggy may be off-track or lane markings are not visible."
-            )
+        # Log only when vector count changes (e.g. 2→1, 1→0).
+        if msg.vector_count != self._last_vector_count:
+            if msg.vector_count == 0:
+                self.get_logger().warn(
+                    "[EDGE] No edge vectors detected — buggy may be off-track."
+                )
+            else:
+                self.get_logger().info(
+                    f"[EDGE] Tracking {msg.vector_count} edge vector(s)."
+                )
+            self._last_vector_count = msg.vector_count
 
         self.publisher_edge_vectors.publish(msg)
 

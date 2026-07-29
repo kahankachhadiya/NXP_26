@@ -164,6 +164,10 @@ class LineFollower(Node):
         # ── ZONE_APPROACH timeout ──────────────────────────────────────────
         self.last_sign_time = None            # time.time() of last sign detection
 
+        # ── Throttle counters for high-frequency callbacks ─────────────────
+        self._pid_log_counter   = 0
+        self._lidar_log_counter = 0
+
         # ── 10 Hz control loop ─────────────────────────────────────────────
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
 
@@ -203,10 +207,6 @@ class LineFollower(Node):
                 if time.time() < self.turn_override_end_time:
                     turn  = self.turn_override_value
                     speed = self.target_speed
-                    self.get_logger().info(
-                        f"[DRIVE] Turn override active: steer={turn:.2f}, "
-                        f"remaining={self.turn_override_end_time - time.time():.1f}s."
-                    )
                 else:
                     # Override expired — cancel it and resume PID steering.
                     self.turn_override_active = False
@@ -329,11 +329,14 @@ class LineFollower(Node):
             min(speed_cap, speed_cap * (1.0 - abs(self.target_turn)))
         )
 
-        self.get_logger().info(
-            f"[PID] centroid_x={centroid_x:.1f}, error={error:.3f}, "
-            f"u={u:.3f} → turn={self.target_turn:.3f}, speed={self.target_speed:.3f} "
-            f"(state={self.current_state.name})."
-        )
+        # Throttle PID log to once every 30 callbacks.
+        self._pid_log_counter += 1
+        if self._pid_log_counter >= 30:
+            self._pid_log_counter = 0
+            self.get_logger().info(
+                f"[PID] error={error:.3f}, turn={self.target_turn:.3f}, "
+                f"speed={self.target_speed:.3f} (state={self.current_state.name})."
+            )
 
     # ================================================================== #
     #  Callback: LIDAR → obstacle detection                              #
@@ -365,10 +368,7 @@ class LineFollower(Node):
                 )
                 self.target_speed = 0.0
                 self.target_turn  = 0.0
-            else:
-                self.get_logger().info(
-                    f"[LIDAR] Still blocked — nearest obstacle: {min_dist:.2f} m."
-                )
+            # No else — don't log "still blocked" every scan cycle.
         elif self.current_state == State.OBSTACLE_DETECTED:
             self._transition(
                 State.TRACKING,
@@ -403,11 +403,6 @@ class LineFollower(Node):
 
         expected_sign = TARGET_SIGN_MAP.get(self.active_target, "")
 
-        self.get_logger().info(
-            f"[SIGN] Received sign='{sign}'. "
-            f"Active target='{self.active_target}' expects sign='{expected_sign}'."
-        )
-
         is_target_sign      = (sign == expected_sign)
         is_directional_sign = (sign in DIRECTIONAL_SIGNS)
 
@@ -417,10 +412,6 @@ class LineFollower(Node):
                     State.ZONE_APPROACH,
                     f"Sign '{sign}' triggered zone approach "
                     f"({'target match' if is_target_sign else 'directional'})."
-                )
-            else:
-                self.get_logger().info(
-                    f"[SIGN] Already in ZONE_APPROACH — refreshing timeout clock."
                 )
 
             # Refresh the ZONE_APPROACH timeout clock.
@@ -443,15 +434,6 @@ class LineFollower(Node):
                     f"[SIGN] RIGHT turn override armed: "
                     f"steer={TURN_OVERRIDE_RIGHT} for {TURN_OVERRIDE_DURATION}s."
                 )
-            elif sign == "Straight":
-                self.get_logger().info(
-                    "[SIGN] STRAIGHT — no turn override; PID continues."
-                )
-        else:
-            self.get_logger().info(
-                f"[SIGN] Sign '{sign}' is NOT relevant to current target "
-                f"'{self.active_target}' — ignoring."
-            )
 
     # ================================================================== #
     #  Callback: QR code → server handshake trigger                      #
@@ -479,16 +461,14 @@ class LineFollower(Node):
             return
 
         payload = message.data
-        self.get_logger().info(
-            f"[QR] QR payload received: '{payload}'. "
-            f"Checking for partial match with active_target='{self.active_target}'."
-        )
+        if self.current_state in (State.SERVER_HANDSHAKE, State.MISSION_COMPLETE):
+            return
 
         # Partial match: active_target substring inside payload.
         if self.active_target in payload:
             self.get_logger().info(
-                f"[QR] *** MATCH CONFIRMED: '{self.active_target}' found in '{payload}'. "
-                "Stopping buggy and initiating SERVER_HANDSHAKE. ***"
+                f"[QR] MATCH: '{self.active_target}' found in '{payload}' — "
+                "stopping and initiating SERVER_HANDSHAKE."
             )
             self.target_speed = 0.0
             self.target_turn  = 0.0
@@ -497,11 +477,6 @@ class LineFollower(Node):
                 f"QR matched active_target='{self.active_target}'."
             )
             self.send_server_message(payload)
-        else:
-            self.get_logger().info(
-                f"[QR] No match — '{self.active_target}' not found in '{payload}'. "
-                "Ignoring."
-            )
 
     # ================================================================== #
     #  Callback: Server response → mission progression                   #
@@ -527,24 +502,11 @@ class LineFollower(Node):
              c. Transition back to TRACKING to resume driving.
         3. If neither rule matches, log a warning and remain in current state.
         """
-        self.get_logger().info(
-            f"[SERVER] <<< Received from server: src={message.src}, "
-            f"dest={message.dest}, ack={message.ack}, msg='{message.msg}'."
-        )
-
         # Only process messages addressed to us (buggy = dest 1).
         if message.dest != 1:
-            self.get_logger().info(
-                f"[SERVER] Message dest={message.dest} — not for us (expected 1). Ignoring."
-            )
             return
 
         payload = message.msg.strip()
-        self.get_logger().info(
-            f"[SERVER] Processing payload: '{payload}' "
-            f"(current state={self.current_state.name}, "
-            f"active_target='{self.active_target}')."
-        )
 
         # ── Rule 1: Mission complete signal ───────────────────────────
         if "COMPLETED" in payload.upper():

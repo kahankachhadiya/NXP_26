@@ -97,22 +97,19 @@ class QRDetector(Node):
             # Only log and publish when the payload is new (avoid log/topic spam).
             if qr_payload != self._last_published:
                 self.get_logger().info(
-                    f"[QR] *** NEW QR CODE DETECTED: '{qr_payload}' "
-                    "— publishing to /qr_detection ***"
+                    f"[QR] NEW QR CODE DETECTED: '{qr_payload}' — publishing to /qr_detection"
                 )
                 self._last_published = qr_payload
-            else:
-                self.get_logger().info(
-                    f"[QR] Same QR code seen again: '{qr_payload}' — re-publishing."
-                )
 
             msg = String()
             msg.data = qr_payload
             self.publisher_qr.publish(msg)
 
         else:
-            if self._frame_count % 60 == 0:
-                self.get_logger().info("[QR] No QR code found in this frame.")
+            # Clear last published so the same code gets logged again if re-scanned later.
+            if self._last_published is not None:
+                self.get_logger().info("[QR] QR code no longer in view.")
+                self._last_published = None
 
     # ---------------------------------------------------------------------- #
     #  Detection logic                                                        #
@@ -148,26 +145,10 @@ class QRDetector(Node):
         if not barcodes:
             return None
 
-        self.get_logger().info(
-            f"[QR] pyzbar found {len(barcodes)} barcode(s) in this frame."
-        )
-
         for barcode in barcodes:
-            self.get_logger().info(
-                f"[QR] Barcode type='{barcode.type}', "
-                f"raw_data='{barcode.data}'."
-            )
             if barcode.type == 'QRCODE':
-                payload = barcode.data.decode('utf-8')
-                self.get_logger().info(
-                    f"[QR] Confirmed QRCODE barcode. Decoded payload: '{payload}'."
-                )
-                # Return on the first QR code found.
-                return payload
+                return barcode.data.decode('utf-8')
 
-        self.get_logger().info(
-            "[QR] Barcodes found but none had type == 'QRCODE'. Ignoring."
-        )
         return None
 
 

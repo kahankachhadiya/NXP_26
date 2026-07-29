@@ -33,45 +33,40 @@ TURN_MAX   =  1.0
 TURN_MIN   = -1.0
 
 # ── Directional bias applied to PID error when a turn sign is pending ───────
-# A positive bias shifts the centroid left of centre → PID steers left.
-# Tune this: larger = more aggressive lean toward the intended side.
 TURN_BIAS_LEFT     =  0.4   # added to normalised error (pushes PID left)
 TURN_BIAS_RIGHT    = -0.4   # added to normalised error (pushes PID right)
 
 # ── Boundary constraint ──────────────────────────────────────────────────────
-# When only one edge vector is visible the buggy is near that boundary.
-# A correction turn is applied to steer away from it.
-# Value is the normalised turn magnitude (0–1) applied toward the open side.
-BOUNDARY_CORRECTION_TURN = 0.5
-# Speed cap when running on a single boundary vector (slow down, recover).
-BOUNDARY_SPEED_CAP       = 0.2
+BOUNDARY_CORRECTION_TURN = 0.5   # turn magnitude when only one vector visible
+BOUNDARY_SPEED_CAP       = 0.2   # speed cap during boundary correction
 
 # ── Speed while navigating a ZONE_APPROACH ──────────────────────────────────
-ZONE_SPEED_FRACTION = 0.4   # fraction of SPEED_MAX used in ZONE_APPROACH
-# Speed used when no edge vectors are visible at a known junction (pending dir)
-NO_VECTOR_SPEED     = 0.15
+ZONE_SPEED_FRACTION = 0.4    # fraction of SPEED_MAX in ZONE_APPROACH
+NO_VECTOR_SPEED     = 0.15   # creep speed at a known junction gap
+
+# ── Obstacle avoidance ───────────────────────────────────────────────────────
+AVOIDANCE_SPEED = 0.15   # forward speed while steering around obstacle
+AVOIDANCE_TURN  = 0.6    # turn magnitude — direction chosen from LIDAR clearance
 
 # ── ZONE_APPROACH auto-expiry ────────────────────────────────────────────────
-ZONE_APPROACH_TIMEOUT  = 5.0   # seconds without a new sign → revert to TRACKING
+ZONE_APPROACH_TIMEOUT = 5.0   # seconds without a new sign → revert to TRACKING
 
 # ── PID gains ───────────────────────────────────────────────────────────────
 KP = 0.35
 KI = 0.0
-KD = 0.25
+KD = 0.35
 
 # ── Steering deadband ────────────────────────────────────────────────────────
-# Normalised errors smaller than this are treated as zero — prevents the buggy
-# reacting to minor camera noise when driving straight.
-STEERING_DEADBAND = 0.05
+STEERING_DEADBAND = 0.05   # normalised errors below this are zeroed (reduces wobble)
 
 
 # ── FSM States ───────────────────────────────────────────────────────────────
 class State(Enum):
-    TRACKING          = 0   # Normal lane-following at full speed
-    OBSTACLE_DETECTED = 1   # LIDAR triggered — motors stopped
-    ZONE_APPROACH     = 2   # Near a location sign — slowed, watching for QR
-    SERVER_HANDSHAKE  = 3   # Stopped at QR; waiting for server response
-    MISSION_COMPLETE  = 4   # All deliveries done; permanently stopped
+    TRACKING           = 0   # Normal lane-following at full speed
+    OBSTACLE_AVOIDANCE = 1   # Steering around an obstacle until back inside track
+    ZONE_APPROACH      = 2   # Near a location sign — slowed, watching for QR
+    SERVER_HANDSHAKE   = 3   # Stopped at QR; waiting for server response
+    MISSION_COMPLETE   = 4   # All deliveries done; permanently stopped
 
 
 # ── Target mapping ───────────────────────────────────────────────────────────
@@ -175,12 +170,14 @@ class LineFollower(Node):
         self.integral   = 0.0
 
         # ── Pending direction from last directional sign ───────────────────
-        # Set when a Left/Right/Straight sign is seen; cleared on TRACKING entry.
-        # Values: None, 'Left', 'Right', 'Straight'
         self.pending_direction = None
 
+        # ── Obstacle avoidance steer direction ────────────────────────────
+        # Set by lidar_callback; +ve = left, -ve = right.
+        self.avoidance_turn_value = 0.0
+
         # ── ZONE_APPROACH timeout ──────────────────────────────────────────
-        self.last_sign_time = None            # time.time() of last sign detection
+        self.last_sign_time = None
 
         # ── Throttle counters for high-frequency callbacks ─────────────────
         self._pid_log_counter   = 0
@@ -214,10 +211,13 @@ class LineFollower(Node):
         msg = Joy()
         msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]
 
-        if self.current_state in (State.MISSION_COMPLETE, State.SERVER_HANDSHAKE,
-                                  State.OBSTACLE_DETECTED):
+        if self.current_state in (State.MISSION_COMPLETE, State.SERVER_HANDSHAKE):
             speed = 0.0
             turn  = 0.0
+        elif self.current_state == State.OBSTACLE_AVOIDANCE:
+            # Drive slowly while steering around the obstacle.
+            speed = AVOIDANCE_SPEED
+            turn  = self.avoidance_turn_value
         else:
             turn  = max(TURN_MIN,  min(TURN_MAX,  self.target_turn))
             speed = max(SPEED_MIN, min(SPEED_MAX, self.target_speed))
@@ -296,8 +296,20 @@ class LineFollower(Node):
         ZONE_APPROACH timeout: revert to TRACKING if no sign seen for
         ZONE_APPROACH_TIMEOUT seconds.
         """
-        if self.current_state not in (State.TRACKING, State.ZONE_APPROACH):
+        if self.current_state not in (State.TRACKING, State.ZONE_APPROACH,
+                                       State.OBSTACLE_AVOIDANCE):
             return
+
+        # ── If avoiding and both lane lines reappear → back inside track ──
+        if self.current_state == State.OBSTACLE_AVOIDANCE:
+            if message.vector_count == 2:
+                self._transition(
+                    State.TRACKING,
+                    "Both edge vectors visible — back inside track after avoidance."
+                )
+            else:
+                # Still avoiding — let publish_drive_commands send avoidance cmds.
+                return
 
         # ── ZONE_APPROACH timeout check ────────────────────────────────
         if (self.current_state == State.ZONE_APPROACH
@@ -406,34 +418,50 @@ class LineFollower(Node):
         """
         Monitor the forward sector for obstacles.
 
-        Extracts the front ~22% of the scan arc (indices N*7/18 to N*11/18),
-        filters non-finite values, and transitions to OBSTACLE_DETECTED if the
-        closest reading is within 0.8 m.  Recovers to TRACKING once clear.
+        On obstacle detection: compute which side has more clearance from the
+        LIDAR scan, set avoidance_turn_value toward the clearer side, and enter
+        OBSTACLE_AVOIDANCE.  The buggy drives slowly while turning until
+        edge_vectors_callback sees both lane lines again.
 
-        Does not interrupt SERVER_HANDSHAKE or MISSION_COMPLETE states.
+        Ignores obstacles during SERVER_HANDSHAKE and MISSION_COMPLETE.
         """
         if self.current_state in (State.SERVER_HANDSHAKE, State.MISSION_COMPLETE):
             return
 
         N = len(message.ranges)
-        front = message.ranges[int(N * 7 / 18) : int(N * 11 / 18)]
-        finite_ranges = [r for r in front if math.isfinite(r)]
-        min_dist = min(finite_ranges) if finite_ranges else math.inf
+
+        # Forward sector — centre ~22% of the scan arc.
+        front_start = int(N * 7 / 18)
+        front_end   = int(N * 11 / 18)
+        front       = message.ranges[front_start:front_end]
+        finite_front = [r for r in front if math.isfinite(r)]
+        min_dist = min(finite_front) if finite_front else math.inf
 
         if min_dist < 0.8:
-            if self.current_state != State.OBSTACLE_DETECTED:
+            if self.current_state != State.OBSTACLE_AVOIDANCE:
+                # Decide avoidance direction: compare clearance on left vs right.
+                left_ranges  = [r for r in message.ranges[:front_start]   if math.isfinite(r)]
+                right_ranges = [r for r in message.ranges[front_end:]     if math.isfinite(r)]
+                left_clear   = sum(left_ranges)  / len(left_ranges)  if left_ranges  else 0.0
+                right_clear  = sum(right_ranges) / len(right_ranges) if right_ranges else 0.0
+
+                # Steer toward the side with more average clearance.
+                if left_clear >= right_clear:
+                    self.avoidance_turn_value =  AVOIDANCE_TURN   # steer left
+                    side = "LEFT"
+                else:
+                    self.avoidance_turn_value = -AVOIDANCE_TURN   # steer right
+                    side = "RIGHT"
+
                 self._transition(
-                    State.OBSTACLE_DETECTED,
-                    f"Obstacle at {min_dist:.2f} m (threshold 0.8 m)."
+                    State.OBSTACLE_AVOIDANCE,
+                    f"Obstacle at {min_dist:.2f} m — steering {side} to avoid."
                 )
-                self.target_speed = 0.0
-                self.target_turn  = 0.0
-            # No else — don't log "still blocked" every scan cycle.
-        elif self.current_state == State.OBSTACLE_DETECTED:
-            self._transition(
-                State.TRACKING,
-                f"Path clear — nearest obstacle now {min_dist:.2f} m."
-            )
+
+        elif self.current_state == State.OBSTACLE_AVOIDANCE:
+            # Obstacle cleared from front — but stay in OBSTACLE_AVOIDANCE
+            # until edge_vectors_callback confirms we are back inside the track.
+            pass
 
     # ================================================================== #
     #  Callback: Sign board → intersection navigation                    #

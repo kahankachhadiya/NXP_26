@@ -32,13 +32,19 @@ SPEED_MIN  =  0.0
 TURN_MAX   =  1.0
 TURN_MIN   = -1.0
 
-# ── Intersection turn override parameters ───────────────────────────────────
-TURN_OVERRIDE_DURATION = 2.0   # seconds to hold turn after directional sign
-TURN_OVERRIDE_LEFT     =  0.6  # positive = left
-TURN_OVERRIDE_RIGHT    = -0.6  # negative = right
+# ── Directional bias applied to PID error when a turn sign is pending ───────
+# A positive bias shifts the centroid left of centre → PID steers left.
+# Tune this: larger = more aggressive lean toward the intended side.
+TURN_BIAS_LEFT     =  0.4   # added to normalised error (pushes PID left)
+TURN_BIAS_RIGHT    = -0.4   # added to normalised error (pushes PID right)
+
+# ── Speed while navigating a ZONE_APPROACH ──────────────────────────────────
+ZONE_SPEED_FRACTION = 0.4   # fraction of SPEED_MAX used in ZONE_APPROACH
+# Speed used when no edge vectors are visible (creep forward until line reappears)
+NO_VECTOR_SPEED     = 0.15
 
 # ── ZONE_APPROACH auto-expiry ────────────────────────────────────────────────
-ZONE_APPROACH_TIMEOUT  = 3.0   # seconds without a new sign → revert to TRACKING
+ZONE_APPROACH_TIMEOUT  = 5.0   # seconds without a new sign → revert to TRACKING
 
 # ── PID gains ───────────────────────────────────────────────────────────────
 KP = 0.6
@@ -155,11 +161,10 @@ class LineFollower(Node):
         self.prev_error = 0.0
         self.integral   = 0.0
 
-        # ── Turn override (intersection navigation) ────────────────────────
-        # When a directional sign is seen, we temporarily lock the steer output.
-        self.turn_override_active    = False
-        self.turn_override_value     = 0.0
-        self.turn_override_end_time  = 0.0   # wall-clock epoch seconds
+        # ── Pending direction from last directional sign ───────────────────
+        # Set when a Left/Right/Straight sign is seen; cleared on TRACKING entry.
+        # Values: None, 'Left', 'Right', 'Straight'
+        self.pending_direction = None
 
         # ── ZONE_APPROACH timeout ──────────────────────────────────────────
         self.last_sign_time = None            # time.time() of last sign detection
@@ -187,8 +192,7 @@ class LineFollower(Node):
         Priority chain (highest to lowest):
           1. MISSION_COMPLETE or SERVER_HANDSHAKE → always 0,0.
           2. OBSTACLE_DETECTED → always 0,0.
-          3. Turn override active (intersection manoeuvre) → use override steer.
-          4. Normal PID output.
+          3. Normal PID output (directional bias applied inside edge_vectors_callback).
 
         msg.axes layout: [0.0, speed, 0.0, turn]
           speed : positive = forward  (range -1..1)
@@ -202,22 +206,8 @@ class LineFollower(Node):
             speed = 0.0
             turn  = 0.0
         else:
-            # Check if a turn override is still active.
-            if self.turn_override_active:
-                if time.time() < self.turn_override_end_time:
-                    turn  = self.turn_override_value
-                    speed = self.target_speed
-                else:
-                    # Override expired — cancel it and resume PID steering.
-                    self.turn_override_active = False
-                    self.get_logger().info(
-                        "[DRIVE] Turn override EXPIRED — resuming PID steering."
-                    )
-                    turn  = max(TURN_MIN,  min(TURN_MAX,  self.target_turn))
-                    speed = max(SPEED_MIN, min(SPEED_MAX, self.target_speed))
-            else:
-                turn  = max(TURN_MIN,  min(TURN_MAX,  self.target_turn))
-                speed = max(SPEED_MIN, min(SPEED_MAX, self.target_speed))
+            turn  = max(TURN_MIN,  min(TURN_MAX,  self.target_turn))
+            speed = max(SPEED_MIN, min(SPEED_MAX, self.target_speed))
 
         msg.axes = [0.0, speed, 0.0, turn]
         self.publisher_joy.publish(msg)
@@ -235,6 +225,11 @@ class LineFollower(Node):
             + (f"| reason: {reason}" if reason else "")
             + " ***"
         )
+        # Clear pending direction whenever we leave ZONE_APPROACH.
+        if new_state == State.TRACKING:
+            self.pending_direction = None
+            self.integral   = 0.0
+            self.prev_error = 0.0
 
     # ================================================================== #
     #  Helper: send message to server                                     #
@@ -274,13 +269,23 @@ class LineFollower(Node):
 
     def edge_vectors_callback(self, message):
         """
-        PID lane-following controller.
+        PID lane-following controller with directional bias.
 
-        Active only in TRACKING and ZONE_APPROACH states.  In ZONE_APPROACH,
-        maximum speed is capped at 50% of SPEED_MAX.
+        Active only in TRACKING and ZONE_APPROACH states.
 
-        Also handles ZONE_APPROACH timeout: if no sign has been seen for
-        ZONE_APPROACH_TIMEOUT seconds, revert automatically to TRACKING.
+        When in ZONE_APPROACH with a pending_direction:
+          - Edge vectors present → apply a bias to the PID error so the buggy
+            naturally leans toward the intended side while still tracking the line.
+          - No edge vectors → creep forward at NO_VECTOR_SPEED with the bias
+            applied as a direct steer value (no line to follow, just aim the
+            direction until the line reappears after the junction).
+
+        When TRACKING or ZONE_APPROACH with no pending direction:
+          - Edge vectors present → standard PID.
+          - No edge vectors → creep forward straight.
+
+        ZONE_APPROACH timeout: revert to TRACKING if no sign seen for
+        ZONE_APPROACH_TIMEOUT seconds.
         """
         if self.current_state not in (State.TRACKING, State.ZONE_APPROACH):
             return
@@ -293,37 +298,45 @@ class LineFollower(Node):
                 State.TRACKING,
                 f"No sign seen for {ZONE_APPROACH_TIMEOUT}s — reverting to full speed."
             )
+            self.pending_direction = None
+
+        # ── Directional bias value for this frame ──────────────────────
+        if self.pending_direction == 'Left':
+            bias = TURN_BIAS_LEFT
+        elif self.pending_direction == 'Right':
+            bias = TURN_BIAS_RIGHT
+        else:
+            bias = 0.0  # Straight or no pending direction — pure PID
+
+        speed_cap = SPEED_MAX * ZONE_SPEED_FRACTION if self.current_state == State.ZONE_APPROACH else SPEED_MAX
 
         half_width = message.image_width / 2.0
+
+        # ── No edge vectors → creep forward in the intended direction ──
+        if message.vector_count == 0:
+            self.target_speed = NO_VECTOR_SPEED
+            self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
+            return
 
         # ── Compute centroid_x from available vectors ──────────────────
         if message.vector_count == 2:
             x1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
             x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
             centroid_x = (x1 + x2) / 2.0
-        elif message.vector_count == 1:
-            centroid_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
         else:
-            self.get_logger().warn(
-                "[PID] No edge vectors received — cannot compute steering. "
-                "Holding previous output."
-            )
-            return
+            centroid_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
 
-        # ── Normalised lateral error ───────────────────────────────────
-        # Positive error → centroid is right of centre → steer right (negative turn).
-        error = (centroid_x - half_width) / half_width
+        # ── Normalised lateral error + directional bias ────────────────
+        # Positive error → centroid right of centre → steer right (negative turn).
+        # Bias shifts the error so PID leans toward the intended direction.
+        error = (centroid_x - half_width) / half_width + bias
 
         self.integral   += error
         derivative       = error - self.prev_error
         u                = self.kp * error + self.ki * self.integral + self.kd * derivative
         self.prev_error  = error
 
-        # Negate: rightward error → negative (right) turn value.
-        self.target_turn = max(TURN_MIN, min(TURN_MAX, -u))
-
-        # ── Speed: inversely proportional to steering effort ───────────
-        speed_cap = SPEED_MAX * 0.5 if self.current_state == State.ZONE_APPROACH else SPEED_MAX
+        self.target_turn  = max(TURN_MIN, min(TURN_MAX, -u))
         self.target_speed = max(
             SPEED_MIN,
             min(speed_cap, speed_cap * (1.0 - abs(self.target_turn)))
@@ -334,8 +347,9 @@ class LineFollower(Node):
         if self._pid_log_counter >= 30:
             self._pid_log_counter = 0
             self.get_logger().info(
-                f"[PID] error={error:.3f}, turn={self.target_turn:.3f}, "
-                f"speed={self.target_speed:.3f} (state={self.current_state.name})."
+                f"[PID] error={error:.3f} (bias={bias:+.2f}), "
+                f"turn={self.target_turn:.3f}, speed={self.target_speed:.3f} "
+                f"(state={self.current_state.name}, dir={self.pending_direction})."
             )
 
     # ================================================================== #
@@ -386,13 +400,14 @@ class LineFollower(Node):
         Logic
         -----
         - If the sign matches the mapped label for active_target OR is a
-          directional sign (Left/Right/Straight), transition to ZONE_APPROACH.
-        - Directional signs additionally arm a turn override:
-            Left     → +0.6 steer for TURN_OVERRIDE_DURATION seconds.
-            Right    → -0.6 steer for TURN_OVERRIDE_DURATION seconds.
-            Straight →  no turn override (PID continues normally).
-        - Any sign refreshes the ZONE_APPROACH timeout clock.
-        - Signs that are irrelevant to the current target are logged but ignored.
+          directional sign (Left/Right/Straight), enter ZONE_APPROACH and
+          store the intended direction as pending_direction.
+        - pending_direction is used in edge_vectors_callback to bias the PID
+          toward the correct side — the turn happens naturally as the buggy
+          tracks the line through the junction.
+        - If no edge vectors are visible at the junction, the buggy creeps
+          forward in the pending_direction until the line reappears.
+        - Signs irrelevant to the current target are ignored.
         """
         if self.current_state == State.MISSION_COMPLETE:
             return
@@ -402,7 +417,6 @@ class LineFollower(Node):
             return
 
         expected_sign = TARGET_SIGN_MAP.get(self.active_target, "")
-
         is_target_sign      = (sign == expected_sign)
         is_directional_sign = (sign in DIRECTIONAL_SIGNS)
 
@@ -417,22 +431,12 @@ class LineFollower(Node):
             # Refresh the ZONE_APPROACH timeout clock.
             self.last_sign_time = time.time()
 
-            # ── Directional turn overrides ─────────────────────────────
-            if sign == "Left":
-                self.turn_override_active   = True
-                self.turn_override_value    = TURN_OVERRIDE_LEFT
-                self.turn_override_end_time = time.time() + TURN_OVERRIDE_DURATION
+            # Store direction only on first detection (don't overwrite mid-turn).
+            if is_directional_sign and self.pending_direction is None:
+                self.pending_direction = sign
                 self.get_logger().info(
-                    f"[SIGN] LEFT turn override armed: "
-                    f"steer={TURN_OVERRIDE_LEFT} for {TURN_OVERRIDE_DURATION}s."
-                )
-            elif sign == "Right":
-                self.turn_override_active   = True
-                self.turn_override_value    = TURN_OVERRIDE_RIGHT
-                self.turn_override_end_time = time.time() + TURN_OVERRIDE_DURATION
-                self.get_logger().info(
-                    f"[SIGN] RIGHT turn override armed: "
-                    f"steer={TURN_OVERRIDE_RIGHT} for {TURN_OVERRIDE_DURATION}s."
+                    f"[SIGN] Pending direction set to '{sign}' — "
+                    "PID will bias toward this side through the junction."
                 )
 
     # ================================================================== #

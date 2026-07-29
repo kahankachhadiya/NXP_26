@@ -110,6 +110,10 @@ class QRDetector(Node):
             if self._last_published is not None:
                 self.get_logger().info("[QR] QR code no longer in view.")
                 self._last_published = None
+                # Publish empty string so subscribers can detect the QR disappearing.
+                msg = String()
+                msg.data = ""
+                self.publisher_qr.publish(msg)
 
     # ---------------------------------------------------------------------- #
     #  Detection logic                                                        #

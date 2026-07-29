@@ -336,18 +336,12 @@ class LineFollower(Node):
         #  CASE 0: No edge vectors at all
         # ════════════════════════════════════════════════════════════════
         if message.vector_count == 0:
-            if self.pending_direction is not None:
-                # Known junction gap — creep in the intended direction.
-                self.target_speed = NO_VECTOR_SPEED
-                self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
-            else:
-                # Completely lost and no known direction — stop to avoid
-                # crossing the boundary blind.
-                self.target_speed = 0.0
-                self.target_turn  = 0.0
-                self.get_logger().warn(
-                    "[BOUNDARY] No edge vectors and no pending direction — stopping."
-                )
+            # No vectors can mean: perfectly centred (lines at frame edges),
+            # known junction gap, or genuinely lost.
+            # In all cases keep moving — don't stop.
+            # Apply bias if we have a pending direction, otherwise go straight.
+            self.target_speed = NO_VECTOR_SPEED
+            self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
             return
 
         # ════════════════════════════════════════════════════════════════

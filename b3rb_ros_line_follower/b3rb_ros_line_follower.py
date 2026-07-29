@@ -50,11 +50,14 @@ AVOIDANCE_TURN      = 0.6
 AVOIDANCE_THRESHOLD = 0.8   # metres — start avoidance
 
 # ── Target approach ───────────────────────────────────────────────────────────
-APPROACH_CREEP_THRESHOLD = 0.6    # metres — slow to creep speed
-APPROACH_STOP_THRESHOLD  = 0.35   # metres — stop for QR scan
+# Applied only when the target location sign has been seen (near destination).
+APPROACH_CREEP_THRESHOLD = 0.45   # metres — slow to creep speed
+APPROACH_STOP_THRESHOLD  = 0.22   # metres — stop for QR scan
 
-# ── Directional sign gap timer ────────────────────────────────────────────────
-DIR_SIGN_TIMEOUT = 5.0   # seconds without directional sign → gap open
+# ── Directional sign: how many consecutive frames of bias drop = turn done ───
+# Once the bias drops (both vectors straddle) for this many frames, the
+# direction is marked consumed and the next board can overwrite it.
+TURN_DONE_FRAMES = 5
 
 # ── PID gains ───────────────────────────────────────────────────────────────
 KP = 0.25
@@ -174,17 +177,19 @@ class LineFollower(Node):
 
         # ── Pending direction from last directional sign ───────────────────
         self.pending_direction = None   # 'Left', 'Right', 'Straight', or None
+        # Counts consecutive frames where bias was dropped (straddling).
+        # When it reaches TURN_DONE_FRAMES the direction is consumed — next
+        # board detection can overwrite pending_direction.
+        self._turn_done_count  = 0
 
         # ── Inline obstacle avoidance ──────────────────────────────────────
-        # avoiding: True while LIDAR sees an obstacle ahead.
-        # avoidance_turn_value: direction chosen from LIDAR clearance.
         self.avoiding             = False
         self.avoidance_turn_value = 0.0
 
-        # ── Directional sign gap tracking ─────────────────────────────────
-        self.dir_sign_visible    = False
-        self.dir_sign_gap_open   = False
-        self._last_dir_sign_time = None
+        # ── Target sign seen flag ──────────────────────────────────────────
+        # True once the target location sign (A/B/C/X/Y/Z) has been detected.
+        # Enables the creep-and-stop approach logic in lidar_callback.
+        self.target_sign_seen = False
 
         # ── Throttle counters ──────────────────────────────────────────────
         self._pid_log_counter = 0
@@ -256,8 +261,10 @@ class LineFollower(Node):
         self.integral            = 0.0
         self.prev_error          = 0.0
         self.pending_direction   = None
+        self._turn_done_count    = 0
         self.avoiding            = False
-        self.dir_sign_visible    = False
+        self.target_sign_seen    = False
+        self.dir_sign_visible    = False  # kept for compat but unused now
         self.dir_sign_gap_open   = False
         self._last_dir_sign_time = None
         self.get_logger().info(
@@ -270,15 +277,13 @@ class LineFollower(Node):
 
     def sign_board_callback(self, message):
         """
-        Process detected sign boards. Always active — no state guards except
-        MISSION_COMPLETE and SERVER_HANDSHAKE for location signs.
-
         Directional sign (Left/Right/Straight):
-          Gap logic: disappeared then reappeared → clear old direction, lock new one.
-          Sets pending_direction. Never changes FSM state.
+          - Lock pending_direction on first detection.
+          - Only allow overwrite when the previous turn is done
+            (_turn_done_count >= TURN_DONE_FRAMES means bias dropped = turn complete).
 
-        Location sign (A/B/C/X/Y/Z) matching active_target:
-          Just logged. QR detector handles the stop.
+        Location sign matching active_target:
+          - Set target_sign_seen so lidar_callback enables close-approach logic.
         """
         if self.current_state == State.MISSION_COMPLETE:
             return
@@ -294,32 +299,19 @@ class LineFollower(Node):
         if not (is_target_sign or is_directional_sign):
             return
 
-        # ── Directional sign ──────────────────────────────────────────────
         if is_directional_sign:
-            now = time.time()
-
-            # Gap logic: fresh board after disappearance → reset direction
-            if not self.dir_sign_visible and self.dir_sign_gap_open:
-                self.pending_direction = None
-                self.dir_sign_gap_open = False
-                self.get_logger().info(
-                    f"[SIGN] New board after gap — locking '{sign}'."
-                )
-
-            self.dir_sign_visible    = True
-            self._last_dir_sign_time = now
-
-            if self.pending_direction is None:
+            if self.pending_direction != sign:
                 self.pending_direction = sign
+                self._turn_done_count  = 0
+                self.get_logger().info(f"[SIGN] Direction: '{sign}'.")
+
+        elif is_target_sign and self.current_state != State.SERVER_HANDSHAKE:
+            if not self.target_sign_seen:
+                self.target_sign_seen = True
                 self.get_logger().info(
-                    f"[SIGN] Direction locked: '{sign}'."
+                    f"[SIGN] Target '{sign}' seen — approach mode active."
                 )
 
-        # ── Location sign ─────────────────────────────────────────────────
-        elif is_target_sign and self.current_state != State.SERVER_HANDSHAKE:
-            self.get_logger().info(
-                f"[SIGN] Target sign '{sign}' seen for '{self.active_target}'."
-            )
 
     # ================================================================== #
     #  Callback: QR code                                                  #
@@ -373,34 +365,21 @@ class LineFollower(Node):
 
         # ── Inline avoidance ──────────────────────────────────────────────
         if self.avoiding:
-            if message.vector_count == 2:
-                ax1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-                ax2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
-                if (ax1 < half_width) != (ax2 < half_width):
-                    # Vectors on both sides — back inside track.
-                    self.avoiding = False
-                    self.get_logger().info("[AVOID] Back inside track — resuming PID.")
-                    # Fall through to normal PID.
+            if message.vector_count >= 1:
+                # Use boundary correction — steer away from whichever side is visible.
+                if message.vector_count == 2:
+                    vec_x = ((message.vector_1[0].x + message.vector_1[1].x) / 2.0 +
+                             (message.vector_2[0].x + message.vector_2[1].x) / 2.0) / 2.0
                 else:
-                    # Still on same side — keep steering away.
-                    vec_x = (ax1 + ax2) / 2.0
-                    self.target_turn  = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
-                                        else BOUNDARY_CORRECTION_TURN
-                    self.target_speed = AVOIDANCE_SPEED
-                    return
-
-            elif message.vector_count == 1:
-                vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+                    vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
                 self.target_turn  = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
                                     else BOUNDARY_CORRECTION_TURN
                 self.target_speed = AVOIDANCE_SPEED
-                return
-
             else:
                 # No vectors — creep in avoidance direction.
                 self.target_speed = AVOIDANCE_SPEED
                 self.target_turn  = self.avoidance_turn_value
-                return
+            return
 
         # ── Directional sign gap timer ─────────────────────────────────────
         if (self.dir_sign_visible
@@ -449,9 +428,9 @@ class LineFollower(Node):
         x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
         centroid_x = (x1 + x2) / 2.0
 
-        # Drop bias once straddling — on the new road.
-        if (x1 < half_width) != (x2 < half_width):
-            bias = 0.0
+        # Track how long bias has been zero — used to know turn is done.
+        if bias == 0.0:
+            self._turn_done_count = min(self._turn_done_count + 1, TURN_DONE_FRAMES)
 
         norm_pos   = (centroid_x - half_width) / half_width
         safe_limit = 1.0 - BOUNDARY_ZONE
@@ -508,7 +487,7 @@ class LineFollower(Node):
                         if math.isfinite(r)]
         min_dist     = min(finite_front) if finite_front else math.inf
 
-        if min_dist <= APPROACH_STOP_THRESHOLD:
+        if min_dist <= APPROACH_STOP_THRESHOLD and self.target_sign_seen:
             if self.target_speed > 0.0:
                 self.target_speed = 0.0
                 self.target_turn  = 0.0
@@ -517,7 +496,7 @@ class LineFollower(Node):
                 )
             return
 
-        if min_dist <= APPROACH_CREEP_THRESHOLD:
+        if min_dist <= APPROACH_CREEP_THRESHOLD and self.target_sign_seen:
             self.target_speed = min(self.target_speed, 0.1)
             return
 

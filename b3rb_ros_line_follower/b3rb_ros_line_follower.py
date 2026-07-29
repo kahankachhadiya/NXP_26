@@ -418,6 +418,8 @@ class LineFollower(Node):
             bias = TURN_BIAS_LEFT
         elif self.pending_direction == 'Right':
             bias = TURN_BIAS_RIGHT
+        elif self.pending_direction == 'Straight':
+            bias = 0.0   # handled specially below — active centering, not passive zero
         else:
             bias = 0.0
 
@@ -426,7 +428,12 @@ class LineFollower(Node):
         # ════════════════════════════════════════════════════════════════
         if message.vector_count == 0:
             self.target_speed = NO_VECTOR_SPEED
-            self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
+            if self.pending_direction == 'Straight':
+                # Actively damp any residual turn — do not coast with whatever
+                # steer was last set.
+                self.target_turn = self.target_turn * 0.5
+            else:
+                self.target_turn = max(TURN_MIN, min(TURN_MAX, bias))
             return
 
         # ════════════════════════════════════════════════════════════════
@@ -437,12 +444,18 @@ class LineFollower(Node):
             boundary_turn = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
                             else BOUNDARY_CORRECTION_TURN
 
-            if abs(bias) > 0 and (bias * boundary_turn < 0):
+            if self.pending_direction == 'Straight':
+                # At a junction with one edge visible: ignore the boundary pull
+                # and creep straight. The missing edge is the junction opening —
+                # following it would steer us into the turn we don't want.
+                self.target_turn  = self.target_turn * 0.4
+                self.target_speed = BOUNDARY_SPEED_CAP
+            elif abs(bias) > 0 and (bias * boundary_turn < 0):
                 self.target_turn = max(TURN_MIN, min(TURN_MAX, boundary_turn))
+                self.target_speed = BOUNDARY_SPEED_CAP
             else:
                 self.target_turn = max(TURN_MIN, min(TURN_MAX, boundary_turn + bias))
-
-            self.target_speed = BOUNDARY_SPEED_CAP
+                self.target_speed = BOUNDARY_SPEED_CAP
             return
 
         # ════════════════════════════════════════════════════════════════
@@ -459,14 +472,18 @@ class LineFollower(Node):
         norm_pos   = (centroid_x - half_width) / half_width
         safe_limit = 1.0 - BOUNDARY_ZONE
 
-        if norm_pos > safe_limit:
-            error = norm_pos - safe_limit
-        elif norm_pos < -safe_limit:
-            error = norm_pos + safe_limit
+        if self.pending_direction == 'Straight':
+            # Active centering: pull error toward the lane centre (norm_pos=0)
+            # so the PID fights any drift instead of ignoring it.
+            error = norm_pos * 0.5
         else:
-            error = 0.0
-
-        error += bias
+            if norm_pos > safe_limit:
+                error = norm_pos - safe_limit
+            elif norm_pos < -safe_limit:
+                error = norm_pos + safe_limit
+            else:
+                error = 0.0
+            error += bias
 
         self.integral  += error
         derivative      = error - self.prev_error

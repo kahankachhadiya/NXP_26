@@ -58,7 +58,6 @@ APPROACH_STOP_THRESHOLD  = 0.35  # metres — stop and wait for QR scan
 # ── ZONE_APPROACH auto-expiry ────────────────────────────────────────────────
 ZONE_APPROACH_TIMEOUT   = 5.0   # seconds without a new sign → mark sign as gone
 STRADDLE_CONFIRM_FRAMES = 8     # consecutive frames with vectors on both sides → TRACKING
-STRADDLE_FORCE_TIMEOUT  = 8.0   # seconds after sign gone → force TRACKING regardless
 
 # ── PID gains ───────────────────────────────────────────────────────────────
 KP = 0.25
@@ -401,16 +400,6 @@ class LineFollower(Node):
                     "[ZONE] Sign disappeared — waiting for stable straddle "
                     "before returning to TRACKING."
                 )
-            # Hard fallback: straddle never confirmed → force TRACKING
-            if (self._sign_gone_time is not None
-                    and time.time() - self._sign_gone_time > STRADDLE_FORCE_TIMEOUT):
-                self.get_logger().info(
-                    "[ZONE] Straddle timeout — forcing TRACKING."
-                )
-                self._transition(State.TRACKING, "Straddle force timeout.")
-                self.pending_direction = None
-                self._straddle_count   = 0
-                self._sign_gone_time   = None
 
         # ── Directional bias for this frame ───────────────────────────
         if self.pending_direction == 'Left':

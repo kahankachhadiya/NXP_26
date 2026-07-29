@@ -198,9 +198,9 @@ class LineFollower(Node):
         # Set by qr_detection_callback once a matching QR is seen.
         # Cleared after the server handshake is triggered.
         self._qr_pending_payload = None
-        # Timestamp (time.time()) of the first frame where QR went missing.
-        # None while QR is visible or not yet matched.
-        self._qr_lost_since = None
+        # One-shot ROS timer started when QR disappears; cancelled if QR reappears.
+        self._qr_lost_timer = None
+        self._qr_lost_since = None  # kept for _set_active_target reset compat
 
         # ── Throttle counters ──────────────────────────────────────────────
         self._pid_log_counter = 0
@@ -277,6 +277,9 @@ class LineFollower(Node):
         self.target_sign_seen    = False
         self._qr_pending_payload = None
         self._qr_lost_since      = None
+        if self._qr_lost_timer is not None:
+            self._qr_lost_timer.cancel()
+            self._qr_lost_timer = None
         self.get_logger().info(
             f"[MISSION] {old} → {new_target} (look for sign '{sign}' / QR '{new_target}')"
         )
@@ -366,11 +369,11 @@ class LineFollower(Node):
         """
         Stop-under-QR logic with 1-second disappear debounce:
           1. QR matching active_target seen → slow to QR_CREEP_SPEED,
-             set _qr_pending_payload, clear _qr_lost_since.
+             set _qr_pending_payload, cancel any in-progress lost timer.
           2. QR gone (empty payload) while _qr_pending_payload set →
-             start / update _qr_lost_since timestamp.
-             Only stop + handshake once QR has been absent for >= 1 second.
-             If QR reappears before 1s, reset _qr_lost_since (dropout ignored).
+             start a one-shot 1-second ROS timer.
+             If QR reappears before timer fires, cancel the timer.
+             When timer fires → stop + handshake.
         """
         if self.current_state in (State.SERVER_HANDSHAKE, State.MISSION_COMPLETE):
             return
@@ -381,42 +384,21 @@ class LineFollower(Node):
         if payload == "":
             if self._qr_pending_payload is None:
                 return   # never saw a matching QR — ignore
-
-            now = time.time()
-            if self._qr_lost_since is None:
-                # First empty frame — start the clock.
-                self._qr_lost_since = now
-                self.get_logger().info("[QR] QR out of view — debounce started (1 s).")
-                return
-
-            elapsed = now - self._qr_lost_since
-            if elapsed >= 1.0:
-                # QR has been gone for a full second — we're under the post.
-                qr_payload = self._qr_pending_payload
-                self._qr_pending_payload = None
-                self._qr_lost_since      = None
-                self.get_logger().info(
-                    f"[QR] QR absent for {elapsed:.2f} s — stopped under post. "
-                    f"Sending '{qr_payload}' to server."
-                )
-                self.target_speed = 0.0
-                self.target_turn  = 0.0
-                self.avoiding     = False
-                self._transition(
-                    State.SERVER_HANDSHAKE,
-                    f"Arrived under QR '{self.active_target}'."
-                )
-                self.send_server_message(qr_payload)
+            if self._qr_lost_timer is None:
+                # Start a one-shot 1 s timer.
+                self._qr_lost_timer = self.create_timer(1.0, self._on_qr_lost_confirmed)
+                self.get_logger().info("[QR] QR out of view — 1 s timer started.")
             return
 
         # ── QR visible ───────────────────────────────────────────────────
         if self.active_target not in payload:
             return
 
-        # QR is back — cancel any in-progress disappear debounce.
-        if self._qr_lost_since is not None:
-            self.get_logger().info("[QR] QR reappeared — debounce reset (dropout ignored).")
-            self._qr_lost_since = None
+        # QR is back — cancel the lost timer if running.
+        if self._qr_lost_timer is not None:
+            self._qr_lost_timer.cancel()
+            self._qr_lost_timer = None
+            self.get_logger().info("[QR] QR reappeared — lost timer cancelled (dropout ignored).")
 
         if self._qr_pending_payload is None:
             self.get_logger().info(
@@ -426,6 +408,34 @@ class LineFollower(Node):
             self.target_speed = min(self.target_speed, QR_CREEP_SPEED)
 
         self._qr_pending_payload = payload
+
+    def _on_qr_lost_confirmed(self):
+        """Fired 1 second after QR disappeared — buggy is under the post."""
+        self._qr_lost_timer.cancel()
+        self._qr_lost_timer = None
+
+        if self._qr_pending_payload is None:
+            return   # already handled or reset
+
+        if self.current_state in (State.SERVER_HANDSHAKE, State.MISSION_COMPLETE):
+            return
+
+        qr_payload = self._qr_pending_payload
+        self._qr_pending_payload = None
+        self._qr_lost_since      = None
+
+        self.get_logger().info(
+            f"[QR] 1 s confirmed absent — stopped under post. "
+            f"Sending '{qr_payload}' to server."
+        )
+        self.target_speed = 0.0
+        self.target_turn  = 0.0
+        self.avoiding     = False
+        self._transition(
+            State.SERVER_HANDSHAKE,
+            f"Arrived under QR '{self.active_target}'."
+        )
+        self.send_server_message(qr_payload)
 
     # ================================================================== #
     #  Callback: Edge Vectors → PID steering                             #

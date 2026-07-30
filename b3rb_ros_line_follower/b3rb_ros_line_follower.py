@@ -613,10 +613,14 @@ class LineFollower(Node):
             if not self.avoiding:
                 left_ranges  = [r for r in message.ranges[:front_start] if math.isfinite(r)]
                 right_ranges = [r for r in message.ranges[front_end:]   if math.isfinite(r)]
-                left_clear   = sum(left_ranges)  / len(left_ranges)  if left_ranges  else 0.0
-                right_clear  = sum(right_ranges) / len(right_ranges) if right_ranges else 0.0
 
-                if left_clear >= right_clear:
+                # Worst-case (min vs min): steer toward the side whose closest
+                # obstacle is furthest away. Avoids being fooled by high averages
+                # when a narrow obstacle sits in one corner of the front arc.
+                left_min  = min(left_ranges)  if left_ranges  else math.inf
+                right_min = min(right_ranges) if right_ranges else math.inf
+
+                if left_min >= right_min:
                     self.avoidance_turn_value =  AVOIDANCE_TURN
                     side = "LEFT"
                 else:

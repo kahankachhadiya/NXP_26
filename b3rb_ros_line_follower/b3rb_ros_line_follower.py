@@ -60,26 +60,23 @@ QR_CREEP_SPEED = 0.15   # m/s — speed while QR is visible and matched
 TURN_DONE_FRAMES = 5
 
 # ── PID gains ───────────────────────────────────────────────────────────────
-KP = 0.70   # strong proportional — corrects fast at high speed
+KP = 0.60   # proportional — fast correction
 KI = 0.0
-KD = 0.22   # strong derivative — damps overshoot on sharp turns
+KD = 0.20   # derivative — damps overshoot on sharp turns
 
 # ── Boundary proximity steering ──────────────────────────────────────────────
-# No dead zone — full norm_pos used as PID error so correction starts
-# immediately when the buggy drifts, not only at the outer band edge.
-BOUNDARY_ZONE = 0.0
+# Small dead zone so minor centring wobble doesn't fight the buggy on straights.
+BOUNDARY_ZONE = 0.15   # error = 0 when centroid within inner 70% of lane
 
 # ── Speed control ────────────────────────────────────────────────────────────
-SPEED_REDUCTION_THRESHOLD = 0.15   # kept for reference, quadratic formula used
+SPEED_REDUCTION_THRESHOLD = 0.15
 
 # ── Sharp turn speed floor ────────────────────────────────────────────────────
-# When |turn| exceeds this ratio the buggy is in a sharp corner —
-# clamp speed to this floor regardless of the quadratic formula.
 SHARP_TURN_THRESHOLD = 0.55   # |turn| above this = sharp corner
 SHARP_TURN_SPEED     = 0.22   # m/s floor on sharp corners
 
 # ── Integral windup clamp ────────────────────────────────────────────────────
-INTEGRAL_CLAMP = 0.3   # prevent integral term accumulating through long curves
+INTEGRAL_CLAMP = 0.2
 
 
 # ── FSM States ───────────────────────────────────────────────────────────────
@@ -518,19 +515,19 @@ class LineFollower(Node):
         # ════════════════════════════════════════════════════════════════
         if message.vector_count == 1:
             vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-            # Normalise visible edge position: -1 (left edge) to +1 (right edge).
+            # Normalise visible edge position: -1 (left) to +1 (right).
             edge_norm = (vec_x - half_width) / half_width
 
             if self.pending_direction == 'Straight':
                 self.target_turn  = self.target_turn * 0.4
                 self.target_speed = BOUNDARY_SPEED_CAP
             else:
-                # Proportional steer: push away from the visible edge.
-                # Edge on left (edge_norm < 0) → steer right (+), and vice versa.
-                # Scale factor 1.2 ensures full-lock is reachable at extreme offset.
-                prop_turn = -edge_norm * 1.2 + bias
-                self.target_turn  = max(TURN_MIN, min(TURN_MAX, prop_turn))
-                # Hard speed cap on single-vector (corner) situations.
+                # Steer away from the visible edge proportionally.
+                # Clamp edge_norm contribution so it doesn't slam to full lock.
+                boundary_steer = max(-0.6, min(0.6, -edge_norm * 0.8))
+                # Bias is added directly to the output turn, not into PID error.
+                raw_turn = boundary_steer + bias
+                self.target_turn  = max(TURN_MIN, min(TURN_MAX, raw_turn))
                 self.target_speed = min(BOUNDARY_SPEED_CAP, SHARP_TURN_SPEED * 1.5)
             return
 
@@ -546,13 +543,21 @@ class LineFollower(Node):
             self._turn_done_count = min(self._turn_done_count + 1, TURN_DONE_FRAMES)
 
         norm_pos   = (centroid_x - half_width) / half_width
-        # No dead zone — error is the full normalised offset from centre.
-        # This means correction starts immediately when the buggy drifts,
-        # which is critical for tight corners at higher speed.
+        safe_limit = 1.0 - BOUNDARY_ZONE
+
+        # PID error = lane offset from centre, with a small dead zone.
+        # Bias is NOT added to the PID error — it offsets the final turn
+        # output so the PID still converges to lane centre while the buggy
+        # is nudged toward the intended direction at junctions.
         if self.pending_direction == 'Straight':
-            error = norm_pos * 0.5   # gentler centering on straight
+            error = norm_pos * 0.5
         else:
-            error = norm_pos + bias
+            if norm_pos > safe_limit:
+                error = norm_pos - safe_limit
+            elif norm_pos < -safe_limit:
+                error = norm_pos + safe_limit
+            else:
+                error = 0.0
 
         self.integral  += error
         self.integral   = max(-INTEGRAL_CLAMP, min(INTEGRAL_CLAMP, self.integral))
@@ -560,7 +565,10 @@ class LineFollower(Node):
         u               = self.kp * error + self.ki * self.integral + self.kd * derivative
         self.prev_error = error
 
-        self.target_turn = max(TURN_MIN, min(TURN_MAX, -u))
+        # Bias added to final turn output — not into PID error.
+        # This nudges the buggy at junctions without causing the PID to
+        # integrate a constant offset and circle indefinitely.
+        self.target_turn = max(TURN_MIN, min(TURN_MAX, -u + bias))
 
         # Quadratic speed-turn coupling: fast on straights, slows through corners.
         turn_ratio = abs(self.target_turn)

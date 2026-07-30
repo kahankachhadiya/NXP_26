@@ -461,37 +461,26 @@ class LineFollower(Node):
 
         # -- Inline avoidance -----------------------------------------------
         if self.avoiding:
-            if message.vector_count >= 1:
-                if message.vector_count == 2:
-                    vec_x = ((message.vector_1[0].x + message.vector_1[1].x) / 2.0 +
-                             (message.vector_2[0].x + message.vector_2[1].x) / 2.0) / 2.0
-                else:
-                    vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-                self.target_turn  = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
-                                    else BOUNDARY_CORRECTION_TURN
-                self.target_speed = AVOIDANCE_SPEED
-            else:
-                self.target_speed = AVOIDANCE_SPEED
-                self.target_turn  = self.avoidance_turn_value
+            # Keep the avoidance_turn_value set by lidar_callback.
+            # Do NOT recompute turn from edge vectors — that would fight the
+            # avoidance direction. Just maintain avoidance speed.
+            self.target_speed = AVOIDANCE_SPEED
+            self.target_turn  = self.avoidance_turn_value
             return
 
         # -- Directional bias -----------------------------------------------
+        # 'Straight' is treated identically to None — bias=0, normal PID rules.
         if self.pending_direction == 'Left':
             bias = TURN_BIAS_LEFT
         elif self.pending_direction == 'Right':
             bias = TURN_BIAS_RIGHT
-        elif self.pending_direction == 'Straight':
-            bias = 0.0
         else:
             bias = 0.0
 
         # CASE 0: No edge vectors
         if message.vector_count == 0:
             self.target_speed = NO_VECTOR_SPEED
-            if self.pending_direction == 'Straight':
-                self.target_turn = self.target_turn * 0.5
-            else:
-                self.target_turn = max(TURN_MIN, min(TURN_MAX, bias))
+            self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
             return
 
         # CASE 1: Single vector
@@ -500,15 +489,11 @@ class LineFollower(Node):
             boundary_turn = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
                             else BOUNDARY_CORRECTION_TURN
 
-            if self.pending_direction == 'Straight':
-                self.target_turn  = self.target_turn * 0.4
-                self.target_speed = BOUNDARY_SPEED_CAP
-            elif abs(bias) > 0 and (bias * boundary_turn < 0):
+            if abs(bias) > 0 and (bias * boundary_turn < 0):
                 self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_turn))
-                self.target_speed = BOUNDARY_SPEED_CAP
             else:
                 self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_turn + bias))
-                self.target_speed = BOUNDARY_SPEED_CAP
+            self.target_speed = BOUNDARY_SPEED_CAP
             return
 
         # CASE 2: Both vectors
@@ -522,16 +507,13 @@ class LineFollower(Node):
         norm_pos   = (centroid_x - half_width) / half_width
         safe_limit = 1.0 - BOUNDARY_ZONE
 
-        if self.pending_direction == 'Straight':
-            error = norm_pos * 0.5
+        if norm_pos > safe_limit:
+            error = norm_pos - safe_limit
+        elif norm_pos < -safe_limit:
+            error = norm_pos + safe_limit
         else:
-            if norm_pos > safe_limit:
-                error = norm_pos - safe_limit
-            elif norm_pos < -safe_limit:
-                error = norm_pos + safe_limit
-            else:
-                error = 0.0
-            error += bias
+            error = 0.0
+        error += bias
 
         self.integral  += error
         derivative      = error - self.prev_error

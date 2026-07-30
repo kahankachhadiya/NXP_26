@@ -508,9 +508,7 @@ class LineFollower(Node):
         # CASE 0: No edge vectors
         if message.vector_count == 0:
             self.target_speed = NO_VECTOR_SPEED
-            if bias != 0.0:
-                self.target_turn = max(TURN_MIN, min(TURN_MAX, bias))
-            # No bias -> hold last known steering angle to finish the corner.
+            self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
             return
 
         # CASE 1: Single vector

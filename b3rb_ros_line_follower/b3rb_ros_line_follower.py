@@ -61,12 +61,14 @@ QR_CREEP_SPEED = 0.15   # m/s while QR matched and visible
 TURN_DONE_FRAMES = 5
 
 # ── PID gains ───────────────────────────────────────────────────────────────
-KP = 0.25
-KI = 0.0
-KD = 0.08
+KP     = 0.25   # baseline proportional gain (centred in lane)
+KP_MAX = 1.20   # max proportional gain (at the edge — overrides pending dir)
+KI     = 0.0
+KD     = 0.08
+KD_MAX = 0.40   # max derivative gain at edge (damps hard overshoot near wall)
 
 # ── Boundary proximity steering ──────────────────────────────────────────────
-BOUNDARY_ZONE = 0.35
+BOUNDARY_ZONE = 0.35   # outer zone where PID error is non-zero
 
 # ── Speed control ────────────────────────────────────────────────────────────
 SPEED_REDUCTION_THRESHOLD = 0.3
@@ -545,17 +547,31 @@ class LineFollower(Node):
         norm_pos   = (centroid_x - half_width) / half_width
         safe_limit = 1.0 - BOUNDARY_ZONE
 
+        # ── Proximity to edge (0.0 = centred, 1.0 = at safe_limit boundary) ──
+        # Uses the side the buggy is closest to.
+        proximity = min(1.0, abs(norm_pos) / max(safe_limit, 0.01))
+
+        # ── Scale PID gains with proximity ────────────────────────────────────
+        # At centre: KP baseline. At edge: KP_MAX. Linear interpolation.
+        effective_kp = KP + (KP_MAX - KP) * proximity
+        effective_kd = KD + (KD_MAX - KD) * proximity
+
+        # ── Scale bias DOWN as proximity increases ─────────────────────────────
+        # When near the edge, boundary correction must dominate over sign bias.
+        # At centre (proximity=0): full bias. At edge (proximity=1): bias=0.
+        effective_bias = bias * (1.0 - proximity)
+
         if norm_pos > safe_limit:
             error = norm_pos - safe_limit
         elif norm_pos < -safe_limit:
             error = norm_pos + safe_limit
         else:
             error = 0.0
-        error += bias
+        error += effective_bias
 
         self.integral  += error
         derivative      = error - self.prev_error
-        u               = self.kp * error + self.ki * self.integral + self.kd * derivative
+        u               = effective_kp * error + self.ki * self.integral + effective_kd * derivative
         self.prev_error = error
 
         self.target_turn = max(TURN_MIN, min(TURN_MAX, -u))
@@ -568,7 +584,8 @@ class LineFollower(Node):
         if self._pid_log_counter >= 30:
             self._pid_log_counter = 0
             self.get_logger().info(
-                f"[PID] err={error:.3f} bias={bias:+.2f} "
+                f"[PID] err={error:.3f} bias={bias:+.2f} eff_bias={effective_bias:+.2f} "
+                f"prox={proximity:.2f} kp={effective_kp:.2f} "
                 f"turn={self.target_turn:.3f} spd={self.target_speed:.3f} "
                 f"dir={self.pending_direction}"
             )

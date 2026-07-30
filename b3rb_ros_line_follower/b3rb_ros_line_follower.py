@@ -173,7 +173,7 @@ class LineFollower(Node):
         )
 
         # ── Control outputs ────────────────────────────────────────────────
-        self.target_speed = STRAIGHT_SPEED
+        self.target_speed = NORMAL_SPEED
         self.target_turn  = 0.0
 
         # ── PID state ─────────────────────────────────────────────────────

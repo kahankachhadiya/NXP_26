@@ -555,9 +555,16 @@ class LineFollower(Node):
 
         self.target_turn = max(TURN_MIN, min(TURN_MAX, -u))
 
+        # Speed scales down from STRAIGHT_SPEED as turn increases.
+        # Uses STRAIGHT_SPEED as both baseline AND floor — so speed reductions
+        # to STRAIGHT_SPEED actually affect cornering speed.
         excess = max(0.0, abs(self.target_turn) - SPEED_REDUCTION_THRESHOLD)
         scale  = 1.0 - excess / (1.0 - SPEED_REDUCTION_THRESHOLD + 1e-6)
-        self.target_speed = max(SPEED_MIN, min(SPEED_MAX, SPEED_MAX * scale))
+        self.target_speed = max(STRAIGHT_SPEED * 0.5, min(STRAIGHT_SPEED, STRAIGHT_SPEED * scale))
+
+        # Reset integral when error crosses zero — prevents overshoot on corner exit.
+        if (error > 0 and self.prev_error < 0) or (error < 0 and self.prev_error > 0):
+            self.integral = 0.0
 
         self._pid_log_counter += 1
         if self._pid_log_counter >= 30:

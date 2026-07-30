@@ -38,14 +38,14 @@ TURN_BIAS_RIGHT    = -0.48
 
 # ── Boundary constraint ──────────────────────────────────────────────────────
 BOUNDARY_CORRECTION_TURN = 0.5
-BOUNDARY_SPEED_CAP       = 0.36
+BOUNDARY_SPEED_CAP       = 0.29
 
 # ── Speed constants ──────────────────────────────────────────────────────────
-NO_VECTOR_SPEED = 0.27
-STRAIGHT_SPEED  = 0.27
+NO_VECTOR_SPEED = 0.22
+STRAIGHT_SPEED  = 0.22
 
 # ── Obstacle avoidance (inline, no separate FSM state) ───────────────────────
-AVOIDANCE_SPEED     = 0.27
+AVOIDANCE_SPEED     = 0.22
 AVOIDANCE_TURN      = 0.6
 AVOIDANCE_THRESHOLD = 0.8   # metres — start avoidance
 
@@ -675,7 +675,7 @@ class LineFollower(Node):
 
     def _navigate_to_parking(self):
         self.get_logger().info("[PARK] Parking — driving straight 3 s.")
-        self.target_speed = 0.45
+        self.target_speed = 0.36
         self.target_turn  = 0.0
         self._parking_timer = self.create_timer(3.0, self._finish_parking)
 

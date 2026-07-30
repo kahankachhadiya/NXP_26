@@ -33,26 +33,21 @@ TURN_MAX   =  1.0
 TURN_MIN   = -1.0
 
 # ── Directional bias applied to PID error when a turn sign is pending ───────
-TURN_BIAS_LEFT     =  0.65
-TURN_BIAS_RIGHT    = -0.65
+TURN_BIAS_LEFT     =  0.48
+TURN_BIAS_RIGHT    = -0.48
 
 # ── Boundary constraint ──────────────────────────────────────────────────────
-BOUNDARY_CORRECTION_TURN = 0.85
-BOUNDARY_SPEED_CAP       = 0.47
+BOUNDARY_CORRECTION_TURN = 0.5
+BOUNDARY_SPEED_CAP       = 0.36
 
 # ── Speed constants ──────────────────────────────────────────────────────────
-NO_VECTOR_SPEED = 0.35
-STRAIGHT_SPEED  = 0.35
+NO_VECTOR_SPEED = 0.27
+STRAIGHT_SPEED  = 0.27
 
 # ── Obstacle avoidance (inline, no separate FSM state) ───────────────────────
-AVOIDANCE_SPEED     = 0.35
+AVOIDANCE_SPEED     = 0.27
 AVOIDANCE_TURN      = 0.6
 AVOIDANCE_THRESHOLD = 0.8   # metres — start avoidance
-
-# ── Target approach ───────────────────────────────────────────────────────────
-# Applied only when the target location sign has been seen (near destination).
-APPROACH_CREEP_THRESHOLD = 0.30
-APPROACH_STOP_THRESHOLD  = 0.12
 
 # ── Target approach (QR) ─────────────────────────────────────────────────────
 QR_CREEP_SPEED = 0.15   # m/s while QR matched and visible
@@ -62,10 +57,10 @@ TURN_DONE_FRAMES = 5
 
 # ── PID gains ───────────────────────────────────────────────────────────────
 KP     = 0.25   # baseline proportional gain (centred in lane)
-KP_MAX = 1.20   # max proportional gain (at the edge — overrides pending dir)
+KP_MAX = 1.20   # max proportional gain (at the edge)
 KI     = 0.0
-KD     = 0.10
-KD_MAX = 0.50   # max derivative gain at edge (damps hard overshoot near wall)
+KD     = 0.08
+KD_MAX = 0.40   # max derivative gain at edge
 
 # ── Boundary proximity steering ──────────────────────────────────────────────
 BOUNDARY_ZONE = 0.35   # outer zone where PID error is non-zero
@@ -447,14 +442,14 @@ class LineFollower(Node):
         Active only in TRACKING state.
 
         When self.avoiding is True:
-          2 vectors straddling -> steer away from whichever side is visible.
-          0 vectors            -> creep in avoidance direction.
+          Avoidance bias steers away from obstacle, edge vectors still
+          enforced — boundary correction overrides avoidance if near wall.
 
         Normal TRACKING:
-          Bias from pending_direction.
-          CASE 0: creep straight or with bias.
+          Bias from pending_direction (Straight = 0, same as None).
+          CASE 0: hold last turn if no bias, else apply bias.
           CASE 1: boundary correction +/- bias.
-          CASE 2: boundary-proximity PID + bias.
+          CASE 2: proximity-scaled PID + fading bias.
         """
         if self.current_state != State.TRACKING:
             return
@@ -462,14 +457,10 @@ class LineFollower(Node):
         half_width = float(message.image_width) / 2.0
 
         # -- Inline avoidance -----------------------------------------------
-        # Obstacle detected by LIDAR — steer away from it but still respect
-        # edge vectors. avoidance_turn_value acts as the bias for this frame.
-        # Edge boundary correction overrides it if the buggy is near a wall.
         if self.avoiding:
             avoid_bias = self.avoidance_turn_value
 
             if message.vector_count == 0:
-                # No edges visible — just apply avoidance turn at low speed.
                 self.target_speed = AVOIDANCE_SPEED
                 self.target_turn  = max(TURN_MIN, min(TURN_MAX, avoid_bias))
                 return
@@ -478,7 +469,6 @@ class LineFollower(Node):
                 vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
                 boundary_turn = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
                                 else BOUNDARY_CORRECTION_TURN
-                # If avoidance pushes toward the visible edge, boundary wins.
                 if avoid_bias * boundary_turn < 0:
                     self.target_turn = max(TURN_MIN, min(TURN_MAX, boundary_turn))
                 else:
@@ -486,7 +476,6 @@ class LineFollower(Node):
                 self.target_speed = AVOIDANCE_SPEED
                 return
 
-            # Both vectors — use centroid PID with avoidance bias.
             x1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
             x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
             centroid_x = (x1 + x2) / 2.0
@@ -499,7 +488,7 @@ class LineFollower(Node):
                 error = norm_pos + safe_limit
             else:
                 error = 0.0
-            error += avoid_bias   # avoidance bias nudges buggy away from obstacle
+            error += avoid_bias
 
             derivative      = error - self.prev_error
             u               = self.kp * error + self.kd * derivative
@@ -509,7 +498,6 @@ class LineFollower(Node):
             return
 
         # -- Directional bias -----------------------------------------------
-        # 'Straight' is treated identically to None — bias=0, normal PID rules.
         if self.pending_direction == 'Left':
             bias = TURN_BIAS_LEFT
         elif self.pending_direction == 'Right':
@@ -522,7 +510,7 @@ class LineFollower(Node):
             self.target_speed = NO_VECTOR_SPEED
             if bias != 0.0:
                 self.target_turn = max(TURN_MIN, min(TURN_MAX, bias))
-            # No bias → hold last known steering angle to finish the corner.
+            # No bias -> hold last known steering angle to finish the corner.
             return
 
         # CASE 1: Single vector
@@ -549,18 +537,9 @@ class LineFollower(Node):
         norm_pos   = (centroid_x - half_width) / half_width
         safe_limit = 1.0 - BOUNDARY_ZONE
 
-        # ── Proximity to edge (0.0 = centred, 1.0 = at safe_limit boundary) ──
-        # Uses the side the buggy is closest to.
-        proximity = min(1.0, abs(norm_pos) / max(safe_limit, 0.01))
-
-        # ── Scale PID gains with proximity ────────────────────────────────────
-        # At centre: KP baseline. At edge: KP_MAX. Linear interpolation.
+        proximity    = min(1.0, abs(norm_pos) / max(safe_limit, 0.01))
         effective_kp = KP + (KP_MAX - KP) * proximity
         effective_kd = KD + (KD_MAX - KD) * proximity
-
-        # ── Scale bias DOWN as proximity increases ─────────────────────────────
-        # When near the edge, boundary correction must dominate over sign bias.
-        # At centre (proximity=0): full bias. At edge (proximity=1): bias=0.
         effective_bias = bias * (1.0 - proximity)
 
         if norm_pos > safe_limit:
@@ -599,7 +578,7 @@ class LineFollower(Node):
     def lidar_callback(self, message):
         """
         LIDAR - only active in TRACKING.
-        Obstacle avoidance only (QR approach handled by qr_detection_callback).
+        APF proportional obstacle avoidance.
         """
         if self.current_state != State.TRACKING:
             return
@@ -612,19 +591,13 @@ class LineFollower(Node):
         min_dist    = min(front_vals) if front_vals else math.inf
 
         if min_dist < AVOIDANCE_THRESHOLD:
-            # ── Proportional Artificial Potential Field (APF) ──────────────
-            center_idx = N // 2
-
-            # Slices for front-right and front-left arcs.
-            # Index 0 = rear, sweeping CCW: < center is Right, > center is Left.
+            center_idx   = N // 2
             right_sector = [r for r in message.ranges[front_start:center_idx] if math.isfinite(r)]
             left_sector  = [r for r in message.ranges[center_idx:front_end]   if math.isfinite(r)]
 
-            # Repulsive force per sector: normalised average penetration depth.
             right_push = sum(max(0.0, AVOIDANCE_THRESHOLD - r) for r in right_sector) / max(1, len(right_sector))
             left_push  = sum(max(0.0, AVOIDANCE_THRESHOLD - r) for r in left_sector)  / max(1, len(left_sector))
 
-            # Right obstacles push left (+), left obstacles push right (-).
             AVOID_GAIN = 3.5
             raw_turn   = (right_push - left_push) * AVOID_GAIN
             self.avoidance_turn_value = max(-AVOIDANCE_TURN, min(AVOIDANCE_TURN, raw_turn))
@@ -637,7 +610,7 @@ class LineFollower(Node):
                abs(self._last_log_turn - self.avoidance_turn_value) > 0.05:
                 self.get_logger().info(
                     f"[AVOID] APF | L_push:{left_push:.3f} R_push:{right_push:.3f} "
-                    f"→ turn:{self.avoidance_turn_value:.2f}"
+                    f"-> turn:{self.avoidance_turn_value:.2f}"
                 )
                 self._last_log_turn = self.avoidance_turn_value
         else:

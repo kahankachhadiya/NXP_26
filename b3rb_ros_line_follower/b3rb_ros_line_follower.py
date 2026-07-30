@@ -38,14 +38,14 @@ TURN_BIAS_RIGHT    = -0.48
 
 # ── Boundary constraint ──────────────────────────────────────────────────────
 BOUNDARY_CORRECTION_TURN = 0.5
-BOUNDARY_SPEED_CAP       = 0.54   # was 0.36 → +50%
+BOUNDARY_SPEED_CAP       = 0.30   # CASE 1 (single vector / cornering) speed cap
 
 # ── Speed constants ──────────────────────────────────────────────────────────
-NO_VECTOR_SPEED = 0.41   # was 0.27 → +50%
-STRAIGHT_SPEED  = 0.41   # was 0.27 → +50%
+NO_VECTOR_SPEED = 0.27   # creep when no vectors visible
+STRAIGHT_SPEED  = 0.27   # baseline speed — quadratic scales UP from here on straights
 
 # ── Obstacle avoidance (inline, no separate FSM state) ───────────────────────
-AVOIDANCE_SPEED     = 0.41   # was 0.27 → +50%
+AVOIDANCE_SPEED     = 0.30
 AVOIDANCE_TURN      = 0.6
 AVOIDANCE_THRESHOLD = 0.8   # metres — start avoidance
 
@@ -60,20 +60,19 @@ QR_CREEP_SPEED = 0.15   # m/s — speed while QR is visible and matched
 TURN_DONE_FRAMES = 5
 
 # ── PID gains ───────────────────────────────────────────────────────────────
-KP = 0.60   # proportional — fast correction
+KP = 0.65
 KI = 0.0
-KD = 0.20   # derivative — damps overshoot on sharp turns
+KD = 0.22
 
 # ── Boundary proximity steering ──────────────────────────────────────────────
-# Small dead zone so minor centring wobble doesn't fight the buggy on straights.
-BOUNDARY_ZONE = 0.15   # error = 0 when centroid within inner 70% of lane
+BOUNDARY_ZONE = 0.25   # error fires when centroid is in outer 25% of lane
 
 # ── Speed control ────────────────────────────────────────────────────────────
 SPEED_REDUCTION_THRESHOLD = 0.15
 
 # ── Sharp turn speed floor ────────────────────────────────────────────────────
-SHARP_TURN_THRESHOLD = 0.55   # |turn| above this = sharp corner
-SHARP_TURN_SPEED     = 0.22   # m/s floor on sharp corners
+SHARP_TURN_THRESHOLD = 0.45   # lower threshold — clamp sooner
+SHARP_TURN_SPEED     = 0.20   # hard floor on corners
 
 # ── Integral windup clamp ────────────────────────────────────────────────────
 INTEGRAL_CLAMP = 0.2
@@ -570,13 +569,14 @@ class LineFollower(Node):
         # integrate a constant offset and circle indefinitely.
         self.target_turn = max(TURN_MIN, min(TURN_MAX, -u + bias))
 
-        # Quadratic speed-turn coupling: fast on straights, slows through corners.
+        # Speed-turn coupling: quadratic drop from SPEED_MAX on straights
+        # down to STRAIGHT_SPEED at full lock. Hard floor at SHARP_TURN_SPEED
+        # once |turn| exceeds SHARP_TURN_THRESHOLD.
         turn_ratio = abs(self.target_turn)
-        scale = max(0.0, 1.0 - turn_ratio ** 2)
+        # Steeper exponent (^1.5) drops speed faster as turn increases.
+        scale = max(0.0, 1.0 - turn_ratio ** 1.5)
         speed = STRAIGHT_SPEED + (SPEED_MAX - STRAIGHT_SPEED) * scale
 
-        # Hard floor on sharp corners — quadratic alone isn't enough
-        # if STRAIGHT_SPEED is high. Clamp to SHARP_TURN_SPEED when deeply cornering.
         if turn_ratio > SHARP_TURN_THRESHOLD:
             speed = min(speed, SHARP_TURN_SPEED)
 

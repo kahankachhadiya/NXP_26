@@ -26,61 +26,57 @@ from synapse_msgs.msg import EdgeVectors, ServerCommunication
 QOS_PROFILE_DEFAULT = 10
 PI = math.pi
 
-# ── Speed / steer bounds ────────────────────────────────────────────────────
-SPEED_MAX  =  1.0
-SPEED_MIN  =  0.0
-TURN_MAX   =  1.0
-TURN_MIN   = -1.0
+# ── Speed / steer bounds ─────────────────────────────────────────────────────
+SPEED_MAX = 1.0
+SPEED_MIN = 0.0
+TURN_MAX  = 1.0
+TURN_MIN  = -1.0
 
-# ── Directional bias applied to PID error when a turn sign is pending ───────
-TURN_BIAS_LEFT     =  0.48
-TURN_BIAS_RIGHT    = -0.48
+# ── Speed constants ───────────────────────────────────────────────────────────
+NORMAL_SPEED    = 0.32   # cruising speed on straights
+TURNING_SPEED   = 0.20   # speed while executing a directional turn
+NO_VECTOR_SPEED = 0.20   # speed when no edge vectors visible
+AVOIDANCE_SPEED = 0.25   # speed during obstacle avoidance
+QR_CREEP_SPEED  = 0.15   # speed while QR is visible
 
-# ── Boundary constraint ──────────────────────────────────────────────────────
-BOUNDARY_CORRECTION_TURN = 0.5
-BOUNDARY_SPEED_CAP       = 0.30   # CASE 1 (single vector / cornering) speed cap
+# ── Edge safety (ABSOLUTE TOP PRIORITY) ──────────────────────────────────────
+# If any edge vector midpoint is within this fraction of the image width
+# from its wall side, perform a hard linear recovery steer immediately.
+# Nothing overrides this rule.
+EDGE_SAFE_MARGIN  = 0.25   # min fraction of image width from each wall
+EDGE_RECOVERY_TURN = 0.80  # steer magnitude during recovery
 
-# ── Speed constants ──────────────────────────────────────────────────────────
-NO_VECTOR_SPEED = 0.27   # creep when no vectors visible
-STRAIGHT_SPEED  = 0.27   # baseline speed — quadratic scales UP from here on straights
-
-# ── Obstacle avoidance (inline, no separate FSM state) ───────────────────────
-AVOIDANCE_SPEED     = 0.30
-AVOIDANCE_TURN      = 0.6
-AVOIDANCE_THRESHOLD = 0.8   # metres — start avoidance
+# ── Obstacle avoidance ────────────────────────────────────────────────────────
+AVOIDANCE_TURN      = 0.60
+AVOIDANCE_THRESHOLD = 0.80  # metres
 
 # ── Target approach ───────────────────────────────────────────────────────────
-# Buggy creeps slowly once QR is in view; stops when QR disappears from camera
-# (meaning it has passed under the QR post — no LIDAR needed).
-QR_CREEP_SPEED = 0.15   # m/s — speed while QR is visible and matched
+QR_CREEP_SPEED = 0.15   # m/s while QR matched and visible
 
-# ── Directional sign: how many consecutive frames of bias drop = turn done ───
-# Once the bias drops (both vectors straddle) for this many frames, the
-# direction is marked consumed and the next board can overwrite it.
-TURN_DONE_FRAMES = 5
+# ── Directional sign: frames of centred driving before direction consumed ─────
+TURN_DONE_FRAMES = 8
 
-# ── PID gains ───────────────────────────────────────────────────────────────
-KP = 0.65
-KI = 0.0
-KD = 0.22
+# ── PID gains ─────────────────────────────────────────────────────────────────
+KP = 0.55
+KI = 0.00
+KD = 0.18
 
-# ── Boundary proximity steering ──────────────────────────────────────────────
-BOUNDARY_ZONE = 0.25   # error fires when centroid is in outer 25% of lane
+# ── Lane tracking targets ─────────────────────────────────────────────────────
+# When following a direction, the PID targets this normalised position
+# (-1=full left, 0=centre, +1=full right) inside the lane.
+# "Left" means follow the left edge → target is left of centre.
+# "Right" means follow the right edge → target is right of centre.
+FOLLOW_LEFT_TARGET   = -0.35   # norm_pos target when direction is Left
+FOLLOW_RIGHT_TARGET  =  0.35   # norm_pos target when direction is Right
+FOLLOW_CENTRE_TARGET =  0.0    # norm_pos target for centre / straight
 
-# ── Speed control ────────────────────────────────────────────────────────────
-SPEED_REDUCTION_THRESHOLD = 0.15
+# ── Integral windup clamp ─────────────────────────────────────────────────────
+INTEGRAL_CLAMP = 0.20
 
-# ── Sharp turn speed floor ────────────────────────────────────────────────────
-SHARP_TURN_THRESHOLD = 0.45   # lower threshold — clamp sooner
-SHARP_TURN_SPEED     = 0.20   # hard floor on corners
-
-# ── Integral windup clamp ────────────────────────────────────────────────────
-INTEGRAL_CLAMP = 0.2
-
-# ── Hard edge safety (top-priority rule) ─────────────────────────────────────
-# Fraction of image width from each side that triggers emergency steer-away.
-EDGE_DANGER_ZONE   = 0.18   # edge vector within 18% of image width = danger
-EDGE_RECOVERY_TURN = 0.75   # hard steer away from the close edge
+# ── Speed reduction on turns (linear) ────────────────────────────────────────
+# speed = NORMAL_SPEED - SPEED_TURN_SCALE * |turn|
+# clamped to [TURNING_SPEED, NORMAL_SPEED]
+SPEED_TURN_SCALE = 0.40
 
 
 # ── FSM States ───────────────────────────────────────────────────────────────
@@ -452,149 +448,132 @@ class LineFollower(Node):
 
     def edge_vectors_callback(self, message):
         """
-        Lane-following with HARD EDGE SAFETY as the absolute top rule.
+        Simple, robust lane controller.
 
-        Priority order:
-        1. EDGE SAFETY  -- if any edge vector is within EDGE_DANGER_ZONE of
-                           its side, steer hard away and slow down. Unconditional.
-        2. OBSTACLE AVOIDANCE -- steer around detected obstacle.
-        3. PID LANE-CENTRE -- keep centroid centred between both edges.
-        4. DIRECTIONAL BIAS -- junction nudge, suppressed near the bias-side edge.
+        Logic:
+          1. EDGE VIOLATION (absolute)
+             Any edge vector within EDGE_SAFE_MARGIN of its wall?
+             → hard linear steer away, slow to TURNING_SPEED, return.
+             Nothing overrides this.
+
+          2. OBSTACLE AVOIDANCE
+             LIDAR flagged an obstacle → steer around it.
+
+          3. DIRECTION-BASED PID TARGET
+             Sign says Left  → PID targets FOLLOW_LEFT_TARGET  (-0.35)
+             Sign says Right → PID targets FOLLOW_RIGHT_TARGET (+0.35)
+             Else            → PID targets FOLLOW_CENTRE_TARGET (0.0)
+             PID drives norm_pos toward that target.
+             Speed reduced linearly with |turn| (TURNING_SPEED floor).
+
+          4. NO VECTORS → creep with last known turn or straight.
         """
         if self.current_state != State.TRACKING:
             return
 
-        half_width = float(message.image_width) / 2.0
         img_w      = float(message.image_width)
+        half_width = img_w / 2.0
 
-        # Collect edge midpoints once for reuse.
+        # Collect edge x-midpoints.
         edge_xs = []
         if message.vector_count >= 1:
             edge_xs.append((message.vector_1[0].x + message.vector_1[1].x) / 2.0)
         if message.vector_count == 2:
             edge_xs.append((message.vector_2[0].x + message.vector_2[1].x) / 2.0)
 
-        # ================================================================
-        #  PRIORITY 1: HARD EDGE SAFETY -- runs before everything else
-        # ================================================================
+        # ════════════════════════════════════════════════════════════════
+        #  1. EDGE VIOLATION — absolute, unconditional
+        # ════════════════════════════════════════════════════════════════
         if edge_xs:
-            danger_px = img_w * EDGE_DANGER_ZONE
-            too_left  = any(x < danger_px       for x in edge_xs)
-            too_right = any(x > img_w - danger_px for x in edge_xs)
+            margin_px = img_w * EDGE_SAFE_MARGIN
+            for ex in edge_xs:
+                if ex < margin_px:
+                    # Left edge too close — steer right hard.
+                    self.target_turn  =  EDGE_RECOVERY_TURN
+                    self.target_speed =  TURNING_SPEED
+                    self.integral     =  0.0
+                    self.get_logger().info(f"[EDGE] Left wall at {ex:.0f}px — recovery RIGHT")
+                    return
+                if ex > img_w - margin_px:
+                    # Right edge too close — steer left hard.
+                    self.target_turn  = -EDGE_RECOVERY_TURN
+                    self.target_speed =  TURNING_SPEED
+                    self.integral     =  0.0
+                    self.get_logger().info(f"[EDGE] Right wall at {ex:.0f}px — recovery LEFT")
+                    return
 
-            if too_left or too_right:
-                self.target_turn  =  EDGE_RECOVERY_TURN if too_left else -EDGE_RECOVERY_TURN
-                self.target_speed =  SHARP_TURN_SPEED
-                # Reset integral so accumulated error doesn't fight recovery.
-                self.integral = 0.0
-                return   # absolute -- nothing else runs
-
-        # ================================================================
-        #  PRIORITY 2: OBSTACLE AVOIDANCE
-        # ================================================================
+        # ════════════════════════════════════════════════════════════════
+        #  2. OBSTACLE AVOIDANCE
+        # ════════════════════════════════════════════════════════════════
         if self.avoiding:
             if edge_xs:
-                vec_x = edge_xs[0] if len(edge_xs) == 1 else sum(edge_xs) / 2.0
-                self.target_turn  = -BOUNDARY_CORRECTION_TURN if vec_x < half_width                                     else BOUNDARY_CORRECTION_TURN
+                mid = sum(edge_xs) / len(edge_xs)
+                self.target_turn  = 0.5 if mid < half_width else -0.5
                 self.target_speed = AVOIDANCE_SPEED
             else:
                 self.target_speed = AVOIDANCE_SPEED
                 self.target_turn  = self.avoidance_turn_value
             return
 
-        # -- Directional bias ------------------------------------------
-        if self.pending_direction == 'Left':
-            bias = TURN_BIAS_LEFT
-        elif self.pending_direction == 'Right':
-            bias = TURN_BIAS_RIGHT
+        # ════════════════════════════════════════════════════════════════
+        #  3. DIRECTION-BASED PID
+        # ════════════════════════════════════════════════════════════════
+        # Determine PID target from sign direction.
+        if self.pending_direction == "Left":
+            pid_target = FOLLOW_LEFT_TARGET
+        elif self.pending_direction == "Right":
+            pid_target = FOLLOW_RIGHT_TARGET
         else:
-            bias = 0.0
+            pid_target = FOLLOW_CENTRE_TARGET
 
-        # ================================================================
-        #  CASE 0: No edge vectors
-        # ================================================================
-        if message.vector_count == 0:
+        # No edge vectors — creep with bias or damp.
+        if not edge_xs:
             self.target_speed = NO_VECTOR_SPEED
-            if self.pending_direction == 'Straight':
-                self.target_turn = self.target_turn * 0.5
+            if self.pending_direction in ("Left", "Right"):
+                # Hold last turn direction at creep speed.
+                self.target_turn = max(TURN_MIN, min(TURN_MAX, pid_target * 1.5))
             else:
-                self.target_turn = max(TURN_MIN, min(TURN_MAX, bias))
+                self.target_turn = self.target_turn * 0.5   # damp toward straight
             return
 
-        # ================================================================
-        #  CASE 1: Single vector
-        # ================================================================
-        if message.vector_count == 1:
-            vec_x     = edge_xs[0]
-            edge_norm = (vec_x - half_width) / half_width   # -1 left .. +1 right
-
-            if self.pending_direction == 'Straight':
-                self.target_turn  = self.target_turn * 0.4
-                self.target_speed = BOUNDARY_SPEED_CAP
-            else:
-                boundary_steer = max(-0.6, min(0.6, -edge_norm * 0.8))
-                # Zero bias if it pushes toward the visible edge.
-                safe_bias = 0.0 if (edge_norm < 0 and bias > 0) or                                    (edge_norm > 0 and bias < 0) else bias
-                self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_steer + safe_bias))
-                self.target_speed = min(BOUNDARY_SPEED_CAP, SHARP_TURN_SPEED * 1.5)
-            return
-
-        # ================================================================
-        #  CASE 2: Both vectors -- PID + bias
-        # ================================================================
-        x1 = edge_xs[0]
-        x2 = edge_xs[1]
-        centroid_x = (x1 + x2) / 2.0
-
-        if bias == 0.0:
-            self._turn_done_count = min(self._turn_done_count + 1, TURN_DONE_FRAMES)
-
-        norm_pos   = (centroid_x - half_width) / half_width   # -1..+1
-        safe_limit = 1.0 - BOUNDARY_ZONE
-
-        # Bias fades to zero as buggy approaches the bias-side edge.
-        effective_bias = bias
-        if bias > 0 and norm_pos < 0:
-            proximity = min(1.0, abs(norm_pos) / max(safe_limit, 0.01))
-            effective_bias = bias * max(0.0, 1.0 - proximity)
-        elif bias < 0 and norm_pos > 0:
-            proximity = min(1.0, abs(norm_pos) / max(safe_limit, 0.01))
-            effective_bias = bias * max(0.0, 1.0 - proximity)
-
-        # PID error with small dead zone.
-        if self.pending_direction == 'Straight':
-            error = norm_pos * 0.5
-        elif norm_pos > safe_limit:
-            error = norm_pos - safe_limit
-            effective_bias = 0.0
-        elif norm_pos < -safe_limit:
-            error = norm_pos + safe_limit
-            effective_bias = 0.0
+        # Compute centroid (or use single edge if only one visible).
+        if len(edge_xs) == 2:
+            centroid_x = (edge_xs[0] + edge_xs[1]) / 2.0
         else:
-            error = 0.0
+            # Single edge: infer lane centre as one lane-width away from the edge.
+            # Use same PID but with the edge position as proxy.
+            centroid_x = edge_xs[0]
 
-        self.integral += error
-        self.integral  = max(-INTEGRAL_CLAMP, min(INTEGRAL_CLAMP, self.integral))
-        derivative     = error - self.prev_error
-        u              = self.kp * error + self.ki * self.integral + self.kd * derivative
+        norm_pos = (centroid_x - half_width) / half_width   # -1 (left) .. +1 (right)
+
+        # PID error = distance from target position.
+        error = norm_pos - pid_target
+
+        # Turn done detection: when centred near target, increment counter.
+        if abs(error) < 0.1:
+            self._turn_done_count = min(self._turn_done_count + 1, TURN_DONE_FRAMES)
+        else:
+            self._turn_done_count = 0
+
+        self.integral  += error
+        self.integral   = max(-INTEGRAL_CLAMP, min(INTEGRAL_CLAMP, self.integral))
+        derivative      = error - self.prev_error
+        u               = self.kp * error + self.ki * self.integral + self.kd * derivative
         self.prev_error = error
 
-        self.target_turn = max(TURN_MIN, min(TURN_MAX, -u + effective_bias))
+        self.target_turn = max(TURN_MIN, min(TURN_MAX, -u))
 
-        # Speed: fast on straights, hard floor on corners.
-        turn_ratio = abs(self.target_turn)
-        scale      = max(0.0, 1.0 - turn_ratio ** 1.5)
-        speed      = STRAIGHT_SPEED + (SPEED_MAX - STRAIGHT_SPEED) * scale
-        if turn_ratio > SHARP_TURN_THRESHOLD:
-            speed = min(speed, SHARP_TURN_SPEED)
-        self.target_speed = max(SPEED_MIN, min(SPEED_MAX, speed))
+        # Linear speed reduction with turn magnitude.
+        speed = NORMAL_SPEED - SPEED_TURN_SCALE * abs(self.target_turn)
+        self.target_speed = max(TURNING_SPEED, min(NORMAL_SPEED, speed))
 
         self._pid_log_counter += 1
         if self._pid_log_counter >= 30:
             self._pid_log_counter = 0
             self.get_logger().info(
-                f"[PID] err={error:.3f} bias={bias:+.2f} eff={effective_bias:+.2f} "
-                f"norm={norm_pos:.3f} turn={self.target_turn:.3f} spd={self.target_speed:.3f}"
+                f"[PID] dir={self.pending_direction} target={pid_target:+.2f} "
+                f"norm={norm_pos:+.3f} err={error:+.3f} "
+                f"turn={self.target_turn:+.3f} spd={self.target_speed:.3f}"
             )
 
     # ================================================================== #

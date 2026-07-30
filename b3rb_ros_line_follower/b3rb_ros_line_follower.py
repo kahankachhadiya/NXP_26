@@ -522,10 +522,15 @@ class LineFollower(Node):
                 self.target_speed = BOUNDARY_SPEED_CAP
             else:
                 # Steer away from the visible edge proportionally.
-                # Clamp edge_norm contribution so it doesn't slam to full lock.
                 boundary_steer = max(-0.6, min(0.6, -edge_norm * 0.8))
-                # Bias is added directly to the output turn, not into PID error.
-                raw_turn = boundary_steer + bias
+                # Suppress bias if it pushes toward the visible edge.
+                # edge_norm < 0 → left edge visible; bias > 0 → pushing left → suppress.
+                # edge_norm > 0 → right edge visible; bias < 0 → pushing right → suppress.
+                if (edge_norm < 0 and bias > 0) or (edge_norm > 0 and bias < 0):
+                    safe_bias = 0.0   # edge wins
+                else:
+                    safe_bias = bias
+                raw_turn = boundary_steer + safe_bias
                 self.target_turn  = max(TURN_MIN, min(TURN_MAX, raw_turn))
                 self.target_speed = min(BOUNDARY_SPEED_CAP, SHARP_TURN_SPEED * 1.5)
             return
@@ -544,17 +549,34 @@ class LineFollower(Node):
         norm_pos   = (centroid_x - half_width) / half_width
         safe_limit = 1.0 - BOUNDARY_ZONE
 
+        # ── Edge-proximity bias suppression ──────────────────────────────
+        # Scale bias down as the buggy approaches the edge it is being
+        # biased toward. When norm_pos is already past safe_limit on the
+        # bias side, zero the bias entirely — edge safety beats direction.
+        #
+        # bias > 0 → pushing left  (norm_pos < 0 is left side)
+        # bias < 0 → pushing right (norm_pos > 0 is right side)
+        effective_bias = bias
+        if bias > 0 and norm_pos < 0:
+            # How far into the left zone (0 = centre, 1 = at safe_limit edge)
+            proximity = min(1.0, abs(norm_pos) / safe_limit)
+            effective_bias = bias * max(0.0, 1.0 - proximity)
+        elif bias < 0 and norm_pos > 0:
+            proximity = min(1.0, abs(norm_pos) / safe_limit)
+            effective_bias = bias * max(0.0, 1.0 - proximity)
+
         # PID error = lane offset from centre, with a small dead zone.
-        # Bias is NOT added to the PID error — it offsets the final turn
-        # output so the PID still converges to lane centre while the buggy
-        # is nudged toward the intended direction at junctions.
         if self.pending_direction == 'Straight':
             error = norm_pos * 0.5
         else:
             if norm_pos > safe_limit:
+                # Past right edge — hard correction back, no bias
                 error = norm_pos - safe_limit
+                effective_bias = 0.0
             elif norm_pos < -safe_limit:
+                # Past left edge — hard correction back, no bias
                 error = norm_pos + safe_limit
+                effective_bias = 0.0
             else:
                 error = 0.0
 
@@ -564,10 +586,7 @@ class LineFollower(Node):
         u               = self.kp * error + self.ki * self.integral + self.kd * derivative
         self.prev_error = error
 
-        # Bias added to final turn output — not into PID error.
-        # This nudges the buggy at junctions without causing the PID to
-        # integrate a constant offset and circle indefinitely.
-        self.target_turn = max(TURN_MIN, min(TURN_MAX, -u + bias))
+        self.target_turn = max(TURN_MIN, min(TURN_MAX, -u + effective_bias))
 
         # Speed-turn coupling: quadratic drop from SPEED_MAX on straights
         # down to STRAIGHT_SPEED at full lock. Hard floor at SHARP_TURN_SPEED

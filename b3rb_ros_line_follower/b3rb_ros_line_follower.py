@@ -384,8 +384,8 @@ class LineFollower(Node):
                 return   # never saw a matching QR — ignore
             if self._qr_lost_timer is None:
                 # Start a one-shot 1 s timer.
-                self._qr_lost_timer = self.create_timer(1.0, self._on_qr_lost_confirmed)
-                self.get_logger().info("[QR] QR out of view — 1 s timer started.")
+                self._qr_lost_timer = self.create_timer(2.0, self._on_qr_lost_confirmed)
+                self.get_logger().info("[QR] QR out of view — 2 s timer started.")
             return
 
         # ── QR visible ───────────────────────────────────────────────────

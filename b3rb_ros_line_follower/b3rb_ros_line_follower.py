@@ -460,12 +460,50 @@ class LineFollower(Node):
         half_width = float(message.image_width) / 2.0
 
         # -- Inline avoidance -----------------------------------------------
+        # Obstacle detected by LIDAR — steer away from it but still respect
+        # edge vectors. avoidance_turn_value acts as the bias for this frame.
+        # Edge boundary correction overrides it if the buggy is near a wall.
         if self.avoiding:
-            # Keep the avoidance_turn_value set by lidar_callback.
-            # Do NOT recompute turn from edge vectors — that would fight the
-            # avoidance direction. Just maintain avoidance speed.
+            avoid_bias = self.avoidance_turn_value
+
+            if message.vector_count == 0:
+                # No edges visible — just apply avoidance turn at low speed.
+                self.target_speed = AVOIDANCE_SPEED
+                self.target_turn  = max(TURN_MIN, min(TURN_MAX, avoid_bias))
+                return
+
+            if message.vector_count == 1:
+                vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+                boundary_turn = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
+                                else BOUNDARY_CORRECTION_TURN
+                # If avoidance pushes toward the visible edge, boundary wins.
+                if avoid_bias * boundary_turn < 0:
+                    self.target_turn = max(TURN_MIN, min(TURN_MAX, boundary_turn))
+                else:
+                    self.target_turn = max(TURN_MIN, min(TURN_MAX, boundary_turn + avoid_bias))
+                self.target_speed = AVOIDANCE_SPEED
+                return
+
+            # Both vectors — use centroid PID with avoidance bias.
+            x1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+            x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
+            centroid_x = (x1 + x2) / 2.0
+            norm_pos   = (centroid_x - half_width) / half_width
+            safe_limit = 1.0 - BOUNDARY_ZONE
+
+            if norm_pos > safe_limit:
+                error = norm_pos - safe_limit
+            elif norm_pos < -safe_limit:
+                error = norm_pos + safe_limit
+            else:
+                error = 0.0
+            error += avoid_bias   # avoidance bias nudges buggy away from obstacle
+
+            derivative      = error - self.prev_error
+            u               = self.kp * error + self.kd * derivative
+            self.prev_error = error
+            self.target_turn  = max(TURN_MIN, min(TURN_MAX, -u))
             self.target_speed = AVOIDANCE_SPEED
-            self.target_turn  = self.avoidance_turn_value
             return
 
         # -- Directional bias -----------------------------------------------

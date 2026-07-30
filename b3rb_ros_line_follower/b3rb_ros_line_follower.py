@@ -610,32 +610,38 @@ class LineFollower(Node):
         min_dist    = min(front_vals) if front_vals else math.inf
 
         if min_dist < AVOIDANCE_THRESHOLD:
-            if not self.avoiding:
-                left_ranges  = [r for r in message.ranges[:front_start] if math.isfinite(r)]
-                right_ranges = [r for r in message.ranges[front_end:]   if math.isfinite(r)]
+            # ── Proportional Artificial Potential Field (APF) ──────────────
+            center_idx = N // 2
 
-                # Worst-case (min vs min): steer toward the side whose closest
-                # obstacle is furthest away. Avoids being fooled by high averages
-                # when a narrow obstacle sits in one corner of the front arc.
-                left_min  = min(left_ranges)  if left_ranges  else math.inf
-                right_min = min(right_ranges) if right_ranges else math.inf
+            # Slices for front-right and front-left arcs.
+            # Index 0 = rear, sweeping CCW: < center is Right, > center is Left.
+            right_sector = [r for r in message.ranges[front_start:center_idx] if math.isfinite(r)]
+            left_sector  = [r for r in message.ranges[center_idx:front_end]   if math.isfinite(r)]
 
-                if left_min >= right_min:
-                    self.avoidance_turn_value =  AVOIDANCE_TURN
-                    side = "LEFT"
-                else:
-                    self.avoidance_turn_value = -AVOIDANCE_TURN
-                    side = "RIGHT"
+            # Repulsive force per sector: normalised average penetration depth.
+            right_push = sum(max(0.0, AVOIDANCE_THRESHOLD - r) for r in right_sector) / max(1, len(right_sector))
+            left_push  = sum(max(0.0, AVOIDANCE_THRESHOLD - r) for r in left_sector)  / max(1, len(left_sector))
 
-                self.avoiding = True
+            # Right obstacles push left (+), left obstacles push right (-).
+            AVOID_GAIN = 3.5
+            raw_turn   = (right_push - left_push) * AVOID_GAIN
+            self.avoidance_turn_value = max(-AVOIDANCE_TURN, min(AVOIDANCE_TURN, raw_turn))
+
+            self.avoiding     = True
+            self.target_speed = AVOIDANCE_SPEED
+            self.target_turn  = self.avoidance_turn_value
+
+            if not hasattr(self, '_last_log_turn') or \
+               abs(self._last_log_turn - self.avoidance_turn_value) > 0.05:
                 self.get_logger().info(
-                    f"[AVOID] Obstacle at {min_dist:.2f} m — steering {side}."
+                    f"[AVOID] APF | L_push:{left_push:.3f} R_push:{right_push:.3f} "
+                    f"→ turn:{self.avoidance_turn_value:.2f}"
                 )
-                self.target_speed = AVOIDANCE_SPEED
-                self.target_turn  = self.avoidance_turn_value
+                self._last_log_turn = self.avoidance_turn_value
         else:
             if self.avoiding:
                 self.avoiding = False
+                self._last_log_turn = 0.0
                 self.get_logger().info("[AVOID] Path clear — avoidance cancelled.")
 
     # ================================================================== #

@@ -38,14 +38,14 @@ TURN_BIAS_RIGHT    = -0.48
 
 # ── Boundary constraint ──────────────────────────────────────────────────────
 BOUNDARY_CORRECTION_TURN = 0.5
-BOUNDARY_SPEED_CAP       = 0.36
+BOUNDARY_SPEED_CAP       = 0.47
 
 # ── Speed constants ──────────────────────────────────────────────────────────
-NO_VECTOR_SPEED = 0.27
-STRAIGHT_SPEED  = 0.27
+NO_VECTOR_SPEED = 0.35
+STRAIGHT_SPEED  = 0.35
 
 # ── Obstacle avoidance (inline, no separate FSM state) ───────────────────────
-AVOIDANCE_SPEED     = 0.27
+AVOIDANCE_SPEED     = 0.35
 AVOIDANCE_TURN      = 0.6
 AVOIDANCE_THRESHOLD = 0.8   # metres — start avoidance
 
@@ -64,8 +64,8 @@ TURN_DONE_FRAMES = 5
 KP     = 0.25   # baseline proportional gain (centred in lane)
 KP_MAX = 1.20   # max proportional gain (at the edge — overrides pending dir)
 KI     = 0.0
-KD     = 0.08
-KD_MAX = 0.40   # max derivative gain at edge (damps hard overshoot near wall)
+KD     = 0.10
+KD_MAX = 0.50   # max derivative gain at edge (damps hard overshoot near wall)
 
 # ── Boundary proximity steering ──────────────────────────────────────────────
 BOUNDARY_ZONE = 0.35   # outer zone where PID error is non-zero

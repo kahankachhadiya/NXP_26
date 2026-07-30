@@ -33,8 +33,8 @@ TURN_MAX   =  1.0
 TURN_MIN   = -1.0
 
 # ── Directional bias applied to PID error when a turn sign is pending ───────
-TURN_BIAS_LEFT     =  0.48
-TURN_BIAS_RIGHT    = -0.48
+TURN_BIAS_LEFT     =  0.65
+TURN_BIAS_RIGHT    = -0.65
 
 # ── Boundary constraint ──────────────────────────────────────────────────────
 BOUNDARY_CORRECTION_TURN = 0.85

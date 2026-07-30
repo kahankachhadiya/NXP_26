@@ -37,7 +37,7 @@ TURN_BIAS_LEFT     =  0.48
 TURN_BIAS_RIGHT    = -0.48
 
 # ── Boundary constraint ──────────────────────────────────────────────────────
-BOUNDARY_CORRECTION_TURN = 0.5
+BOUNDARY_CORRECTION_TURN = 0.85
 BOUNDARY_SPEED_CAP       = 0.47
 
 # ── Speed constants ──────────────────────────────────────────────────────────
@@ -520,7 +520,9 @@ class LineFollower(Node):
         # CASE 0: No edge vectors
         if message.vector_count == 0:
             self.target_speed = NO_VECTOR_SPEED
-            self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
+            if bias != 0.0:
+                self.target_turn = max(TURN_MIN, min(TURN_MAX, bias))
+            # No bias → hold last known steering angle to finish the corner.
             return
 
         # CASE 1: Single vector

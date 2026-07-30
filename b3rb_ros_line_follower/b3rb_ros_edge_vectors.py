@@ -39,7 +39,7 @@ GREEN_COLOR = (0,   255, 0)
 
 # What fraction of the image height (from the bottom) is analyzed.
 # Smaller value → looks further ahead; larger value → looks directly below buggy.
-VECTOR_IMAGE_HEIGHT_PERCENTAGE = 0.225
+VECTOR_IMAGE_HEIGHT_PERCENTAGE = 0.35
 
 # Discard tiny contour vectors that are likely noise.
 VECTOR_MAGNITUDE_MINIMUM = 2.25

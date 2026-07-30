@@ -77,6 +77,11 @@ SHARP_TURN_SPEED     = 0.20   # hard floor on corners
 # ── Integral windup clamp ────────────────────────────────────────────────────
 INTEGRAL_CLAMP = 0.2
 
+# ── Hard edge safety (top-priority rule) ─────────────────────────────────────
+# Fraction of image width from each side that triggers emergency steer-away.
+EDGE_DANGER_ZONE   = 0.18   # edge vector within 18% of image width = danger
+EDGE_RECOVERY_TURN = 0.75   # hard steer away from the close edge
+
 
 # ── FSM States ───────────────────────────────────────────────────────────────
 class State(Enum):
@@ -442,172 +447,154 @@ class LineFollower(Node):
         self.send_server_message(qr_payload)
 
     # ================================================================== #
-    #  Callback: Edge Vectors → PID steering                             #
+    #  Callback: Edge Vectors -> PID steering                            #
     # ================================================================== #
 
     def edge_vectors_callback(self, message):
         """
-        PID lane-following with inline obstacle avoidance.
-        Active only in TRACKING state.
+        Lane-following with HARD EDGE SAFETY as the absolute top rule.
 
-        When self.avoiding is True:
-          2 vectors straddling → obstacle cleared, resume normal PID.
-          2 vectors same side  → steer away from that side.
-          1 vector             → steer away from visible boundary.
-          0 vectors            → creep in avoidance direction.
-
-        Normal TRACKING:
-          Gap timer for directional signs.
-          Bias from pending_direction (dropped once vectors straddle).
-          CASE 0: creep straight or with bias.
-          CASE 1: boundary correction ± bias.
-          CASE 2: boundary-proximity PID + bias.
+        Priority order:
+        1. EDGE SAFETY  -- if any edge vector is within EDGE_DANGER_ZONE of
+                           its side, steer hard away and slow down. Unconditional.
+        2. OBSTACLE AVOIDANCE -- steer around detected obstacle.
+        3. PID LANE-CENTRE -- keep centroid centred between both edges.
+        4. DIRECTIONAL BIAS -- junction nudge, suppressed near the bias-side edge.
         """
         if self.current_state != State.TRACKING:
             return
 
         half_width = float(message.image_width) / 2.0
+        img_w      = float(message.image_width)
 
-        # ── Inline avoidance ──────────────────────────────────────────────
+        # Collect edge midpoints once for reuse.
+        edge_xs = []
+        if message.vector_count >= 1:
+            edge_xs.append((message.vector_1[0].x + message.vector_1[1].x) / 2.0)
+        if message.vector_count == 2:
+            edge_xs.append((message.vector_2[0].x + message.vector_2[1].x) / 2.0)
+
+        # ================================================================
+        #  PRIORITY 1: HARD EDGE SAFETY -- runs before everything else
+        # ================================================================
+        if edge_xs:
+            danger_px = img_w * EDGE_DANGER_ZONE
+            too_left  = any(x < danger_px       for x in edge_xs)
+            too_right = any(x > img_w - danger_px for x in edge_xs)
+
+            if too_left or too_right:
+                self.target_turn  =  EDGE_RECOVERY_TURN if too_left else -EDGE_RECOVERY_TURN
+                self.target_speed =  SHARP_TURN_SPEED
+                # Reset integral so accumulated error doesn't fight recovery.
+                self.integral = 0.0
+                return   # absolute -- nothing else runs
+
+        # ================================================================
+        #  PRIORITY 2: OBSTACLE AVOIDANCE
+        # ================================================================
         if self.avoiding:
-            if message.vector_count >= 1:
-                # Use boundary correction — steer away from whichever side is visible.
-                if message.vector_count == 2:
-                    vec_x = ((message.vector_1[0].x + message.vector_1[1].x) / 2.0 +
-                             (message.vector_2[0].x + message.vector_2[1].x) / 2.0) / 2.0
-                else:
-                    vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-                self.target_turn  = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
-                                    else BOUNDARY_CORRECTION_TURN
+            if edge_xs:
+                vec_x = edge_xs[0] if len(edge_xs) == 1 else sum(edge_xs) / 2.0
+                self.target_turn  = -BOUNDARY_CORRECTION_TURN if vec_x < half_width                                     else BOUNDARY_CORRECTION_TURN
                 self.target_speed = AVOIDANCE_SPEED
             else:
-                # No vectors — creep in avoidance direction.
                 self.target_speed = AVOIDANCE_SPEED
                 self.target_turn  = self.avoidance_turn_value
             return
 
-        # ── Directional bias ──────────────────────────────────────────────
+        # -- Directional bias ------------------------------------------
         if self.pending_direction == 'Left':
             bias = TURN_BIAS_LEFT
         elif self.pending_direction == 'Right':
             bias = TURN_BIAS_RIGHT
-        elif self.pending_direction == 'Straight':
-            bias = 0.0   # handled specially below — active centering, not passive zero
         else:
             bias = 0.0
 
-        # ════════════════════════════════════════════════════════════════
+        # ================================================================
         #  CASE 0: No edge vectors
-        # ════════════════════════════════════════════════════════════════
+        # ================================================================
         if message.vector_count == 0:
             self.target_speed = NO_VECTOR_SPEED
             if self.pending_direction == 'Straight':
-                # Actively damp any residual turn — do not coast with whatever
-                # steer was last set.
                 self.target_turn = self.target_turn * 0.5
             else:
                 self.target_turn = max(TURN_MIN, min(TURN_MAX, bias))
             return
 
-        # ════════════════════════════════════════════════════════════════
-        #  CASE 1: Single vector — one edge visible (sharp turn entry/exit)
-        # ════════════════════════════════════════════════════════════════
+        # ================================================================
+        #  CASE 1: Single vector
+        # ================================================================
         if message.vector_count == 1:
-            vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-            # Normalise visible edge position: -1 (left) to +1 (right).
-            edge_norm = (vec_x - half_width) / half_width
+            vec_x     = edge_xs[0]
+            edge_norm = (vec_x - half_width) / half_width   # -1 left .. +1 right
 
             if self.pending_direction == 'Straight':
                 self.target_turn  = self.target_turn * 0.4
                 self.target_speed = BOUNDARY_SPEED_CAP
             else:
-                # Steer away from the visible edge proportionally.
                 boundary_steer = max(-0.6, min(0.6, -edge_norm * 0.8))
-                # Suppress bias if it pushes toward the visible edge.
-                # edge_norm < 0 → left edge visible; bias > 0 → pushing left → suppress.
-                # edge_norm > 0 → right edge visible; bias < 0 → pushing right → suppress.
-                if (edge_norm < 0 and bias > 0) or (edge_norm > 0 and bias < 0):
-                    safe_bias = 0.0   # edge wins
-                else:
-                    safe_bias = bias
-                raw_turn = boundary_steer + safe_bias
-                self.target_turn  = max(TURN_MIN, min(TURN_MAX, raw_turn))
+                # Zero bias if it pushes toward the visible edge.
+                safe_bias = 0.0 if (edge_norm < 0 and bias > 0) or                                    (edge_norm > 0 and bias < 0) else bias
+                self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_steer + safe_bias))
                 self.target_speed = min(BOUNDARY_SPEED_CAP, SHARP_TURN_SPEED * 1.5)
             return
 
-        # ════════════════════════════════════════════════════════════════
-        #  CASE 2: Both vectors
-        # ════════════════════════════════════════════════════════════════
-        x1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-        x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
+        # ================================================================
+        #  CASE 2: Both vectors -- PID + bias
+        # ================================================================
+        x1 = edge_xs[0]
+        x2 = edge_xs[1]
         centroid_x = (x1 + x2) / 2.0
 
-        # Track how long bias has been zero — used to know turn is done.
         if bias == 0.0:
             self._turn_done_count = min(self._turn_done_count + 1, TURN_DONE_FRAMES)
 
-        norm_pos   = (centroid_x - half_width) / half_width
+        norm_pos   = (centroid_x - half_width) / half_width   # -1..+1
         safe_limit = 1.0 - BOUNDARY_ZONE
 
-        # ── Edge-proximity bias suppression ──────────────────────────────
-        # Scale bias down as the buggy approaches the edge it is being
-        # biased toward. When norm_pos is already past safe_limit on the
-        # bias side, zero the bias entirely — edge safety beats direction.
-        #
-        # bias > 0 → pushing left  (norm_pos < 0 is left side)
-        # bias < 0 → pushing right (norm_pos > 0 is right side)
+        # Bias fades to zero as buggy approaches the bias-side edge.
         effective_bias = bias
         if bias > 0 and norm_pos < 0:
-            # How far into the left zone (0 = centre, 1 = at safe_limit edge)
-            proximity = min(1.0, abs(norm_pos) / safe_limit)
+            proximity = min(1.0, abs(norm_pos) / max(safe_limit, 0.01))
             effective_bias = bias * max(0.0, 1.0 - proximity)
         elif bias < 0 and norm_pos > 0:
-            proximity = min(1.0, abs(norm_pos) / safe_limit)
+            proximity = min(1.0, abs(norm_pos) / max(safe_limit, 0.01))
             effective_bias = bias * max(0.0, 1.0 - proximity)
 
-        # PID error = lane offset from centre, with a small dead zone.
+        # PID error with small dead zone.
         if self.pending_direction == 'Straight':
             error = norm_pos * 0.5
+        elif norm_pos > safe_limit:
+            error = norm_pos - safe_limit
+            effective_bias = 0.0
+        elif norm_pos < -safe_limit:
+            error = norm_pos + safe_limit
+            effective_bias = 0.0
         else:
-            if norm_pos > safe_limit:
-                # Past right edge — hard correction back, no bias
-                error = norm_pos - safe_limit
-                effective_bias = 0.0
-            elif norm_pos < -safe_limit:
-                # Past left edge — hard correction back, no bias
-                error = norm_pos + safe_limit
-                effective_bias = 0.0
-            else:
-                error = 0.0
+            error = 0.0
 
-        self.integral  += error
-        self.integral   = max(-INTEGRAL_CLAMP, min(INTEGRAL_CLAMP, self.integral))
-        derivative      = error - self.prev_error
-        u               = self.kp * error + self.ki * self.integral + self.kd * derivative
+        self.integral += error
+        self.integral  = max(-INTEGRAL_CLAMP, min(INTEGRAL_CLAMP, self.integral))
+        derivative     = error - self.prev_error
+        u              = self.kp * error + self.ki * self.integral + self.kd * derivative
         self.prev_error = error
 
         self.target_turn = max(TURN_MIN, min(TURN_MAX, -u + effective_bias))
 
-        # Speed-turn coupling: quadratic drop from SPEED_MAX on straights
-        # down to STRAIGHT_SPEED at full lock. Hard floor at SHARP_TURN_SPEED
-        # once |turn| exceeds SHARP_TURN_THRESHOLD.
+        # Speed: fast on straights, hard floor on corners.
         turn_ratio = abs(self.target_turn)
-        # Steeper exponent (^1.5) drops speed faster as turn increases.
-        scale = max(0.0, 1.0 - turn_ratio ** 1.5)
-        speed = STRAIGHT_SPEED + (SPEED_MAX - STRAIGHT_SPEED) * scale
-
+        scale      = max(0.0, 1.0 - turn_ratio ** 1.5)
+        speed      = STRAIGHT_SPEED + (SPEED_MAX - STRAIGHT_SPEED) * scale
         if turn_ratio > SHARP_TURN_THRESHOLD:
             speed = min(speed, SHARP_TURN_SPEED)
-
         self.target_speed = max(SPEED_MIN, min(SPEED_MAX, speed))
 
         self._pid_log_counter += 1
         if self._pid_log_counter >= 30:
             self._pid_log_counter = 0
             self.get_logger().info(
-                f"[PID] err={error:.3f} bias={bias:+.2f} "
-                f"turn={self.target_turn:.3f} spd={self.target_speed:.3f} "
-                f"dir={self.pending_direction}"
+                f"[PID] err={error:.3f} bias={bias:+.2f} eff={effective_bias:+.2f} "
+                f"norm={norm_pos:.3f} turn={self.target_turn:.3f} spd={self.target_speed:.3f}"
             )
 
     # ================================================================== #

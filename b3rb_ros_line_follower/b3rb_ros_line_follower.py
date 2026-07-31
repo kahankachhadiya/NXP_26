@@ -507,13 +507,19 @@ class LineFollower(Node):
 
         # CASE 0: No edge vectors
         if message.vector_count == 0:
-            if bias != 0.0:
-                self.target_turn = max(TURN_MIN, min(TURN_MAX, bias))
-            # If bias == 0.0, DO NOT overwrite self.target_turn.
-            # Hold the last known steering angle to safely coast through the corner!
-            # ── Reactive Speed Scaling ──
-            turn_magnitude    = abs(self.target_turn)
-            self.target_speed = NO_VECTOR_SPEED * (1.0 - (turn_magnitude * 0.40))
+            if self.pending_direction == 'Straight':
+                # Vectors gone at a junction — drive dead straight at full speed
+                # until a vector reappears and demands a correction.
+                self.target_turn  = 0.0
+                self.target_speed = NO_VECTOR_SPEED
+            elif bias != 0.0:
+                self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
+                turn_magnitude    = abs(self.target_turn)
+                self.target_speed = NO_VECTOR_SPEED * (1.0 - (turn_magnitude * 0.40))
+            else:
+                # None — hold last known steering angle, reactive speed.
+                turn_magnitude    = abs(self.target_turn)
+                self.target_speed = NO_VECTOR_SPEED * (1.0 - (turn_magnitude * 0.40))
             return
 
         # CASE 1: Single vector
@@ -522,11 +528,18 @@ class LineFollower(Node):
             boundary_turn = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
                             else BOUNDARY_CORRECTION_TURN
 
-            if abs(bias) > 0 and (bias * boundary_turn < 0):
+            if self.pending_direction == 'Straight':
+                # One edge disappeared — do NOT follow the remaining edge.
+                # That edge is the junction opening; chasing it causes the turn.
+                # Go straight at reduced speed until both vectors return.
+                self.target_turn  = 0.0
+                self.target_speed = BOUNDARY_SPEED_CAP
+            elif abs(bias) > 0 and (bias * boundary_turn < 0):
                 self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_turn))
+                self.target_speed = BOUNDARY_SPEED_CAP
             else:
                 self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_turn + bias))
-            self.target_speed = BOUNDARY_SPEED_CAP
+                self.target_speed = BOUNDARY_SPEED_CAP
             return
 
         # CASE 2: Both vectors

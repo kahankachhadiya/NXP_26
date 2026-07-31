@@ -38,14 +38,14 @@ TURN_BIAS_RIGHT    = -0.48
 
 # ── Boundary constraint ──────────────────────────────────────────────────────
 BOUNDARY_CORRECTION_TURN = 0.5
-BOUNDARY_SPEED_CAP       = 0.42
+BOUNDARY_SPEED_CAP       = 0.28
 
 # ── Speed constants ──────────────────────────────────────────────────────────
-NO_VECTOR_SPEED = 0.33
-STRAIGHT_SPEED  = 0.33
+NO_VECTOR_SPEED = 0.22
+STRAIGHT_SPEED  = 0.22
 
 # ── Obstacle avoidance (inline, no separate FSM state) ───────────────────────
-AVOIDANCE_SPEED     = 0.33
+AVOIDANCE_SPEED     = 0.22
 AVOIDANCE_TURN      = 0.6
 AVOIDANCE_THRESHOLD = 0.8   # metres — start avoidance
 
@@ -505,49 +505,10 @@ class LineFollower(Node):
         else:
             bias = 0.0
 
-        # ── TARGETED LOOKAHEAD SPEED CALCULATION ─────────────────────────────
-        left_vec  = None
-        right_vec = None
-        if message.vector_count == 1:
-            v1_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-            if v1_x < half_width:
-                left_vec  = message.vector_1
-            else:
-                right_vec = message.vector_1
-        elif message.vector_count >= 2:
-            v1_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-            if v1_x < half_width:
-                left_vec  = message.vector_1
-                right_vec = message.vector_2
-            else:
-                left_vec  = message.vector_2
-                right_vec = message.vector_1
-
-        severity = 0.0
-        if self.pending_direction == 'Left':
-            if left_vec:
-                severity = min(1.0, abs(left_vec[0].x - left_vec[1].x) / half_width)
-            else:
-                severity = 1.0   # blackout zone: no target line → max braking
-        elif self.pending_direction == 'Right':
-            if right_vec:
-                severity = min(1.0, abs(right_vec[0].x - right_vec[1].x) / half_width)
-            else:
-                severity = 1.0   # blackout zone: max braking
-        else:
-            s_list = []
-            if left_vec:  s_list.append(abs(left_vec[0].x  - left_vec[1].x)  / half_width)
-            if right_vec: s_list.append(abs(right_vec[0].x - right_vec[1].x) / half_width)
-            if s_list: severity = min(1.0, sum(s_list) / len(s_list))
-
-        max_drop     = STRAIGHT_SPEED * 0.60
-        dynamic_speed = STRAIGHT_SPEED - (severity * max_drop)
-
         # CASE 0: No edge vectors
         if message.vector_count == 0:
-            self.target_speed = dynamic_speed
-            if bias != 0.0:
-                self.target_turn = max(TURN_MIN, min(TURN_MAX, bias))
+            self.target_speed = NO_VECTOR_SPEED
+            self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
             return
 
         # CASE 1: Single vector
@@ -560,7 +521,7 @@ class LineFollower(Node):
                 self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_turn))
             else:
                 self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_turn + bias))
-            self.target_speed = min(BOUNDARY_SPEED_CAP, dynamic_speed)
+            self.target_speed = BOUNDARY_SPEED_CAP
             return
 
         # CASE 2: Both vectors
@@ -594,7 +555,12 @@ class LineFollower(Node):
 
         self.target_turn = max(TURN_MIN, min(TURN_MAX, -u))
 
-        self.target_speed = dynamic_speed
+        # Speed scales down from STRAIGHT_SPEED as turn increases.
+        # Uses STRAIGHT_SPEED as both baseline AND floor — so speed reductions
+        # to STRAIGHT_SPEED actually affect cornering speed.
+        excess = max(0.0, abs(self.target_turn) - SPEED_REDUCTION_THRESHOLD)
+        scale  = 1.0 - excess / (1.0 - SPEED_REDUCTION_THRESHOLD + 1e-6)
+        self.target_speed = max(STRAIGHT_SPEED * 0.5, min(STRAIGHT_SPEED, STRAIGHT_SPEED * scale))
 
         # Reset integral when error crosses zero — prevents overshoot on corner exit.
         if (error > 0 and self.prev_error < 0) or (error < 0 and self.prev_error > 0):

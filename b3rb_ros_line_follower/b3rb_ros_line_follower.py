@@ -47,7 +47,7 @@ STRAIGHT_SPEED  = 0.33
 # ── Obstacle avoidance (inline, no separate FSM state) ───────────────────────
 AVOIDANCE_SPEED     = 0.33
 AVOIDANCE_TURN      = 0.6
-AVOIDANCE_THRESHOLD = 0.8   # metres — start avoidance
+AVOIDANCE_THRESHOLD = 0.5   # metres — start avoidance
 
 # ── Target approach (QR) ─────────────────────────────────────────────────────
 QR_CREEP_SPEED = 0.18   # m/s while QR matched and visible

@@ -508,10 +508,10 @@ class LineFollower(Node):
         # CASE 0: No edge vectors
         if message.vector_count == 0:
             if self.pending_direction == 'Straight':
-                # No edges visible — hold current turn with EMA decay toward 0
-                # so we gently straighten out while coasting.
+                # Decay to straight smoothly instead of snapping.
                 self.target_turn  = self.target_turn * 0.85
-                self.target_speed = NO_VECTOR_SPEED
+                turn_magnitude    = abs(self.target_turn)
+                self.target_speed = NO_VECTOR_SPEED * (1.0 - (turn_magnitude * 0.40))
             elif bias != 0.0:
                 # Blind in a curve — EMA decay toward baseline bias.
                 decay_factor      = 0.80
@@ -528,26 +528,16 @@ class LineFollower(Node):
         # CASE 1: Single vector
         if message.vector_count == 1:
             vec_x     = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-            norm_edge = (vec_x - half_width) / half_width   # -1=left .. +1=right
+            norm_edge = (vec_x - half_width) / half_width   # -1.0 (left) to 1.0 (right)
             boundary_turn = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
                             else BOUNDARY_CORRECTION_TURN
 
             if self.pending_direction == 'Straight':
-                # The remaining edge is a real wall — respect it.
-                # Only correct if the buggy is drifting INTO it (within safe margin).
-                # If it's safely away, go straight.
-                safe_limit = 1.0 - BOUNDARY_ZONE
-                if abs(norm_edge) > safe_limit:
-                    # Too close to this edge — push away proportionally.
-                    penetration = abs(norm_edge) - safe_limit
-                    proximity   = min(1.0, penetration / BOUNDARY_ZONE)
-                    effective_kp = KP + (KP_MAX - KP) * proximity
-                    correction  = effective_kp * penetration
-                    # Push away: edge on left → steer right (+), and vice versa.
-                    self.target_turn = max(TURN_MIN, min(TURN_MAX,
-                        correction if norm_edge < 0 else -correction))
+                # DANGER ZONE: line close to centre (abs < 0.6) — steer away to survive.
+                # SAFE ZONE:   line peeling away at far edge (abs > 0.6) — unwind steering.
+                if abs(norm_edge) < 0.6:
+                    self.target_turn = max(TURN_MIN, min(TURN_MAX, boundary_turn))
                 else:
-                    # Edge is safely away — go straight.
                     self.target_turn = self.target_turn * 0.85
                 self.target_speed = BOUNDARY_SPEED_CAP
             elif abs(bias) > 0 and (bias * boundary_turn < 0):
@@ -563,24 +553,39 @@ class LineFollower(Node):
         x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
         centroid_x = (x1 + x2) / 2.0
 
+        # Gap between the two lines — detects junction expansion.
+        gap_norm = abs(x2 - x1) / half_width
+
         if bias == 0.0:
             self._turn_done_count = min(self._turn_done_count + 1, TURN_DONE_FRAMES)
 
         norm_pos   = (centroid_x - half_width) / half_width
         safe_limit = 1.0 - BOUNDARY_ZONE
 
-        proximity    = min(1.0, abs(norm_pos) / max(safe_limit, 0.01))
-        effective_kp = KP + (KP_MAX - KP) * proximity
-        effective_kd = KD + (KD_MAX - KD) * proximity
-        effective_bias = bias * (1.0 - proximity)
-
-        if norm_pos > safe_limit:
-            error = norm_pos - safe_limit
-        elif norm_pos < -safe_limit:
-            error = norm_pos + safe_limit
+        # ── JUNCTION DETECTION ──
+        if self.pending_direction == 'Straight' and gap_norm > 1.4:
+            # Track width exploded — physically inside the junction.
+            # Ignore centroid error completely and decay steering straight.
+            error        = 0.0
+            self.target_turn = self.target_turn * 0.85
+            proximity    = 0.0
+            effective_kp = KP
+            effective_kd = KD
+            effective_bias = 0.0
         else:
-            error = 0.0
-        error += effective_bias
+            # ── Normal track physics ──
+            proximity      = min(1.0, abs(norm_pos) / max(safe_limit, 0.01))
+            effective_kp   = KP + (KP_MAX - KP) * proximity
+            effective_kd   = KD + (KD_MAX - KD) * proximity
+            effective_bias = bias * (1.0 - proximity)
+
+            if norm_pos > safe_limit:
+                error = norm_pos - safe_limit
+            elif norm_pos < -safe_limit:
+                error = norm_pos + safe_limit
+            else:
+                error = 0.0
+            error += effective_bias
 
         self.integral  += error
         derivative      = error - self.prev_error

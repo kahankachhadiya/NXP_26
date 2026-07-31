@@ -508,13 +508,12 @@ class LineFollower(Node):
         # CASE 0: No edge vectors
         if message.vector_count == 0:
             if self.pending_direction == 'Straight':
-                # Vectors gone at a junction — drive dead straight at full speed
-                # until a vector reappears and demands a correction.
-                self.target_turn  = 0.0
+                # No edges visible — hold current turn with EMA decay toward 0
+                # so we gently straighten out while coasting.
+                self.target_turn  = self.target_turn * 0.85
                 self.target_speed = NO_VECTOR_SPEED
             elif bias != 0.0:
-                # We are blind in a curve! Smoothly decay the steering angle
-                # towards the baseline bias to prevent violent jerks while coasting.
+                # Blind in a curve — EMA decay toward baseline bias.
                 decay_factor      = 0.80
                 self.target_turn  = (self.target_turn * decay_factor) + (bias * (1.0 - decay_factor))
                 self.target_turn  = max(TURN_MIN, min(TURN_MAX, self.target_turn))
@@ -528,15 +527,28 @@ class LineFollower(Node):
 
         # CASE 1: Single vector
         if message.vector_count == 1:
-            vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+            vec_x     = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+            norm_edge = (vec_x - half_width) / half_width   # -1=left .. +1=right
             boundary_turn = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
                             else BOUNDARY_CORRECTION_TURN
 
             if self.pending_direction == 'Straight':
-                # One edge disappeared — do NOT follow the remaining edge.
-                # That edge is the junction opening; chasing it causes the turn.
-                # Go straight at reduced speed until both vectors return.
-                self.target_turn  = 0.0
+                # The remaining edge is a real wall — respect it.
+                # Only correct if the buggy is drifting INTO it (within safe margin).
+                # If it's safely away, go straight.
+                safe_limit = 1.0 - BOUNDARY_ZONE
+                if abs(norm_edge) > safe_limit:
+                    # Too close to this edge — push away proportionally.
+                    penetration = abs(norm_edge) - safe_limit
+                    proximity   = min(1.0, penetration / BOUNDARY_ZONE)
+                    effective_kp = KP + (KP_MAX - KP) * proximity
+                    correction  = effective_kp * penetration
+                    # Push away: edge on left → steer right (+), and vice versa.
+                    self.target_turn = max(TURN_MIN, min(TURN_MAX,
+                        correction if norm_edge < 0 else -correction))
+                else:
+                    # Edge is safely away — go straight.
+                    self.target_turn = self.target_turn * 0.85
                 self.target_speed = BOUNDARY_SPEED_CAP
             elif abs(bias) > 0 and (bias * boundary_turn < 0):
                 self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_turn))

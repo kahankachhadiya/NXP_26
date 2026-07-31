@@ -266,7 +266,9 @@ class LineFollower(Node):
         self.active_target       = new_target
         self.integral            = 0.0
         self.prev_error          = 0.0
-        self.pending_direction   = None
+        # Do NOT reset pending_direction — keep the last known direction
+        # until the new sign board is seen. Prevents going out of control
+        # at the zone exit before the next board is detected.
         self._turn_done_count    = 0
         self.avoiding            = False
         self.target_sign_seen    = False

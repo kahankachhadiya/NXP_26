@@ -513,7 +513,11 @@ class LineFollower(Node):
                 self.target_turn  = 0.0
                 self.target_speed = NO_VECTOR_SPEED
             elif bias != 0.0:
-                self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
+                # We are blind in a curve! Smoothly decay the steering angle
+                # towards the baseline bias to prevent violent jerks while coasting.
+                decay_factor      = 0.80
+                self.target_turn  = (self.target_turn * decay_factor) + (bias * (1.0 - decay_factor))
+                self.target_turn  = max(TURN_MIN, min(TURN_MAX, self.target_turn))
                 turn_magnitude    = abs(self.target_turn)
                 self.target_speed = NO_VECTOR_SPEED * (1.0 - (turn_magnitude * 0.40))
             else:

@@ -497,75 +497,95 @@ class LineFollower(Node):
             self.target_speed = AVOIDANCE_SPEED
             return
 
-        # -- Directional bias -----------------------------------------------
-        if self.pending_direction == 'Left':
-            bias = TURN_BIAS_LEFT
-        elif self.pending_direction == 'Right':
-            bias = TURN_BIAS_RIGHT
-        else:
-            bias = 0.0
+        # ── PURE EDGE TRACKING (WALL FOLLOWING) ──
+        left_vec  = None
+        right_vec = None
 
-        # CASE 0: No edge vectors
-        if message.vector_count == 0:
-            if bias != 0.0:
-                self.target_turn = max(TURN_MIN, min(TURN_MAX, bias))
-            # If bias == 0.0, DO NOT overwrite self.target_turn.
-            # Hold the last known steering angle to safely coast through the corner!
-            # ── Reactive Speed Scaling ──
-            turn_magnitude    = abs(self.target_turn)
-            self.target_speed = NO_VECTOR_SPEED * (1.0 - (turn_magnitude * 0.40))
-            return
-
-        # CASE 1: Single vector
+        # 1. Identify Left and Right vectors
         if message.vector_count == 1:
-            vec_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-            boundary_turn = -BOUNDARY_CORRECTION_TURN if vec_x < half_width \
-                            else BOUNDARY_CORRECTION_TURN
-
-            if abs(bias) > 0 and (bias * boundary_turn < 0):
-                self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_turn))
+            v_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+            if v_x < half_width: left_vec  = message.vector_1
+            else:                right_vec = message.vector_1
+        elif message.vector_count >= 2:
+            v1_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+            v2_x = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
+            if v1_x < v2_x:
+                left_vec  = message.vector_1
+                right_vec = message.vector_2
             else:
-                self.target_turn  = max(TURN_MIN, min(TURN_MAX, boundary_turn + bias))
-            self.target_speed = BOUNDARY_SPEED_CAP
-            return
+                left_vec  = message.vector_2
+                right_vec = message.vector_1
 
-        # CASE 2: Both vectors
-        x1 = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-        x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
-        centroid_x = (x1 + x2) / 2.0
+        safe_limit = 1.0 - BOUNDARY_ZONE
+        error      = 0.0
+        proximity  = 0.0
 
-        if bias == 0.0:
+        # 2. Targeted Error Calculation
+        if self.pending_direction == 'Left':
+            if left_vec:
+                left_x    = (left_vec[0].x + left_vec[1].x) / 2.0
+                norm_left = (left_x - half_width) / half_width
+                error     = -safe_limit - norm_left
+                proximity = min(1.0, abs(error) / BOUNDARY_ZONE)
+            else:
+                # Target line lost mid-turn — hold bias to carve corner blindly.
+                self.target_turn  = max(TURN_MIN, min(TURN_MAX, TURN_BIAS_LEFT))
+                self.target_speed = NO_VECTOR_SPEED * (1.0 - (abs(self.target_turn) * 0.40))
+                return
+
+        elif self.pending_direction == 'Right':
+            if right_vec:
+                right_x    = (right_vec[0].x + right_vec[1].x) / 2.0
+                norm_right = (right_x - half_width) / half_width
+                error      = safe_limit - norm_right
+                proximity  = min(1.0, abs(error) / BOUNDARY_ZONE)
+            else:
+                # Target line lost mid-turn — hold bias.
+                self.target_turn  = max(TURN_MIN, min(TURN_MAX, TURN_BIAS_RIGHT))
+                self.target_speed = NO_VECTOR_SPEED * (1.0 - (abs(self.target_turn) * 0.40))
+                return
+
+        else:
+            # Straight or None — bounded straight driving (ignores lines peeling away).
             self._turn_done_count = min(self._turn_done_count + 1, TURN_DONE_FRAMES)
 
-        norm_pos   = (centroid_x - half_width) / half_width
-        safe_limit = 1.0 - BOUNDARY_ZONE
+            if message.vector_count == 0:
+                # Blind coasting through massive empty intersections.
+                self.target_speed = NO_VECTOR_SPEED * (1.0 - (abs(self.target_turn) * 0.40))
+                return
 
-        proximity    = min(1.0, abs(norm_pos) / max(safe_limit, 0.01))
+            err_left  = 0.0
+            err_right = 0.0
+            if left_vec:
+                left_x    = (left_vec[0].x + left_vec[1].x) / 2.0
+                norm_left = (left_x - half_width) / half_width
+                if norm_left > -safe_limit:   # too close to left line
+                    err_left  = -safe_limit - norm_left
+                    proximity = max(proximity, min(1.0, abs(err_left) / BOUNDARY_ZONE))
+            if right_vec:
+                right_x    = (right_vec[0].x + right_vec[1].x) / 2.0
+                norm_right = (right_x - half_width) / half_width
+                if norm_right < safe_limit:   # too close to right line
+                    err_right = safe_limit - norm_right
+                    proximity = max(proximity, min(1.0, abs(err_right) / BOUNDARY_ZONE))
+            error = err_left + err_right
+
+        # 3. PID Control
         effective_kp = KP + (KP_MAX - KP) * proximity
         effective_kd = KD + (KD_MAX - KD) * proximity
-        effective_bias = bias * (1.0 - proximity)
 
-        if norm_pos > safe_limit:
-            error = norm_pos - safe_limit
-        elif norm_pos < -safe_limit:
-            error = norm_pos + safe_limit
-        else:
-            error = 0.0
-        error += effective_bias
-
-        self.integral  += error
-        derivative      = error - self.prev_error
-        u               = effective_kp * error + self.ki * self.integral + effective_kd * derivative
+        self.integral += error
+        derivative     = error - self.prev_error
+        u              = effective_kp * error + self.ki * self.integral + effective_kd * derivative
         self.prev_error = error
 
         self.target_turn = max(TURN_MIN, min(TURN_MAX, -u))
 
-        # ── Reactive Speed Scaling ──
-        # Reduce speed by up to 40% based on how hard the wheel is turned.
+        # 4. Reactive Speed Scaling (max 40% reduction based on steering angle)
         turn_magnitude    = abs(self.target_turn)
         self.target_speed = STRAIGHT_SPEED * (1.0 - (turn_magnitude * 0.40))
 
-        # Reset integral when error crosses zero — prevents overshoot on corner exit.
+        # Reset integral when error crosses zero to prevent corner-exit overshoot.
         if (error > 0 and self.prev_error < 0) or (error < 0 and self.prev_error > 0):
             self.integral = 0.0
 
@@ -573,11 +593,11 @@ class LineFollower(Node):
         if self._pid_log_counter >= 30:
             self._pid_log_counter = 0
             self.get_logger().info(
-                f"[PID] err={error:.3f} bias={bias:+.2f} eff_bias={effective_bias:+.2f} "
-                f"prox={proximity:.2f} kp={effective_kp:.2f} "
+                f"[PID EDGE] err={error:.3f} prox={proximity:.2f} kp={effective_kp:.2f} "
                 f"turn={self.target_turn:.3f} spd={self.target_speed:.3f} "
                 f"dir={self.pending_direction}"
             )
+
 
     # ================================================================== #
     #  Callback: LIDAR                                                    #

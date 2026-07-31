@@ -38,14 +38,14 @@ TURN_BIAS_RIGHT    = -0.48
 
 # ── Boundary constraint ──────────────────────────────────────────────────────
 BOUNDARY_CORRECTION_TURN = 0.5
-BOUNDARY_SPEED_CAP       = 0.28
+BOUNDARY_SPEED_CAP       = 0.42
 
 # ── Speed constants ──────────────────────────────────────────────────────────
-NO_VECTOR_SPEED = 0.22
-STRAIGHT_SPEED  = 0.22
+NO_VECTOR_SPEED = 0.33
+STRAIGHT_SPEED  = 0.33
 
 # ── Obstacle avoidance (inline, no separate FSM state) ───────────────────────
-AVOIDANCE_SPEED     = 0.22
+AVOIDANCE_SPEED     = 0.33
 AVOIDANCE_TURN      = 0.6
 AVOIDANCE_THRESHOLD = 0.8   # metres — start avoidance
 
@@ -66,7 +66,7 @@ KD_MAX = 0.40   # max derivative gain at edge
 BOUNDARY_ZONE = 0.35   # outer zone where PID error is non-zero
 
 # ── Speed control ────────────────────────────────────────────────────────────
-SPEED_REDUCTION_THRESHOLD = 0.3
+# SPEED_REDUCTION_THRESHOLD removed — replaced by reactive speed scaling.
 
 
 # ── FSM States ───────────────────────────────────────────────────────────────
@@ -507,8 +507,13 @@ class LineFollower(Node):
 
         # CASE 0: No edge vectors
         if message.vector_count == 0:
-            self.target_speed = NO_VECTOR_SPEED
-            self.target_turn  = max(TURN_MIN, min(TURN_MAX, bias))
+            if bias != 0.0:
+                self.target_turn = max(TURN_MIN, min(TURN_MAX, bias))
+            # If bias == 0.0, DO NOT overwrite self.target_turn.
+            # Hold the last known steering angle to safely coast through the corner!
+            # ── Reactive Speed Scaling ──
+            turn_magnitude    = abs(self.target_turn)
+            self.target_speed = NO_VECTOR_SPEED * (1.0 - (turn_magnitude * 0.40))
             return
 
         # CASE 1: Single vector
@@ -555,12 +560,10 @@ class LineFollower(Node):
 
         self.target_turn = max(TURN_MIN, min(TURN_MAX, -u))
 
-        # Speed scales down from STRAIGHT_SPEED as turn increases.
-        # Uses STRAIGHT_SPEED as both baseline AND floor — so speed reductions
-        # to STRAIGHT_SPEED actually affect cornering speed.
-        excess = max(0.0, abs(self.target_turn) - SPEED_REDUCTION_THRESHOLD)
-        scale  = 1.0 - excess / (1.0 - SPEED_REDUCTION_THRESHOLD + 1e-6)
-        self.target_speed = max(STRAIGHT_SPEED * 0.5, min(STRAIGHT_SPEED, STRAIGHT_SPEED * scale))
+        # ── Reactive Speed Scaling ──
+        # Reduce speed by up to 40% based on how hard the wheel is turned.
+        turn_magnitude    = abs(self.target_turn)
+        self.target_speed = STRAIGHT_SPEED * (1.0 - (turn_magnitude * 0.40))
 
         # Reset integral when error crosses zero — prevents overshoot on corner exit.
         if (error > 0 and self.prev_error < 0) or (error < 0 and self.prev_error > 0):

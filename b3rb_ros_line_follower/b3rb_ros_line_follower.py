@@ -527,21 +527,26 @@ class LineFollower(Node):
 
         # ── T-JUNCTION DEAD END DETECTION ──
         if self.pending_direction == 'Straight':
-            is_horizontal = False
-            # Check if Vector 1 is horizontal (width > 2x its height).
+            horizontal_vec = None
+            # Check if Vector 1 is a valid horizontal wall
+            # (Width > 3x height AND spans more than 15% of camera width).
             dx1 = message.vector_1[0].x - message.vector_1[1].x
             dy1 = message.vector_1[0].y - message.vector_1[1].y
-            if abs(dx1) > (abs(dy1) * 2.0):
-                is_horizontal = True
-            # Check if Vector 2 is horizontal.
+            if abs(dx1) > (abs(dy1) * 3.0) and abs(dx1) > (message.image_width * 0.15):
+                horizontal_vec = message.vector_1
+            # Check if Vector 2 is a valid horizontal wall.
             if message.vector_count == 2:
                 dx2 = message.vector_2[0].x - message.vector_2[1].x
                 dy2 = message.vector_2[0].y - message.vector_2[1].y
-                if abs(dx2) > (abs(dy2) * 2.0):
-                    is_horizontal = True
-            if is_horizontal:
-                # Horizontal wall blocking the path — force a hard left turn.
-                self.target_turn  = 0.85   # positive = hard left lock
+                if abs(dx2) > (abs(dy2) * 3.0) and abs(dx2) > (message.image_width * 0.15):
+                    horizontal_vec = message.vector_2
+            if horizontal_vec is not None:
+                # Horizontal wall detected — proportional left turn based on Y distance.
+                # Y=0 is far away (top of screen); Y=image_height is at the bumper.
+                avg_y     = (horizontal_vec[0].y + horizontal_vec[1].y) / 2.0
+                proximity = avg_y / float(message.image_height)
+                # Strictly positive → always turns left.
+                self.target_turn  = min(TURN_MAX, proximity * 1.2)
                 turn_magnitude    = abs(self.target_turn)
                 self.target_speed = BOUNDARY_SPEED_CAP * (1.0 - (turn_magnitude * 0.40))
                 return

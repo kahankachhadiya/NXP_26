@@ -525,6 +525,27 @@ class LineFollower(Node):
                 self.target_speed = NO_VECTOR_SPEED * (1.0 - (turn_magnitude * 0.40))
             return
 
+        # ── T-JUNCTION DEAD END DETECTION ──
+        if self.pending_direction == 'Straight':
+            is_horizontal = False
+            # Check if Vector 1 is horizontal (width > 2x its height).
+            dx1 = message.vector_1[0].x - message.vector_1[1].x
+            dy1 = message.vector_1[0].y - message.vector_1[1].y
+            if abs(dx1) > (abs(dy1) * 2.0):
+                is_horizontal = True
+            # Check if Vector 2 is horizontal.
+            if message.vector_count == 2:
+                dx2 = message.vector_2[0].x - message.vector_2[1].x
+                dy2 = message.vector_2[0].y - message.vector_2[1].y
+                if abs(dx2) > (abs(dy2) * 2.0):
+                    is_horizontal = True
+            if is_horizontal:
+                # Horizontal wall blocking the path — force a hard left turn.
+                self.target_turn  = 0.85   # positive = hard left lock
+                turn_magnitude    = abs(self.target_turn)
+                self.target_speed = BOUNDARY_SPEED_CAP * (1.0 - (turn_magnitude * 0.40))
+                return
+
         # CASE 1: Single vector
         if message.vector_count == 1:
             vec_x     = (message.vector_1[0].x + message.vector_1[1].x) / 2.0

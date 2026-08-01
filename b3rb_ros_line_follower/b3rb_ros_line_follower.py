@@ -525,7 +525,7 @@ class LineFollower(Node):
                 self.target_speed = NO_VECTOR_SPEED * (1.0 - (turn_magnitude * 0.40))
             return
 
-        # ── T-JUNCTION DEAD END DETECTION ──
+        # ── T-JUNCTION DEAD END DETECTION (DEPTH-BASED STEERING) ──
         if self.pending_direction == 'Straight':
             horizontal_vec = None
             # Check if Vector 1 is a valid horizontal wall
@@ -541,12 +541,25 @@ class LineFollower(Node):
                 if abs(dx2) > (abs(dy2) * 3.0) and abs(dx2) > (message.image_width * 0.15):
                     horizontal_vec = message.vector_2
             if horizontal_vec is not None:
-                # Horizontal wall detected — proportional left turn based on Y distance.
-                # Y=0 is far away (top of screen); Y=image_height is at the bumper.
-                avg_y     = (horizontal_vec[0].y + horizontal_vec[1].y) / 2.0
+                # Sort points left-to-right to compare depth.
+                if horizontal_vec[0].x < horizontal_vec[1].x:
+                    left_y  = horizontal_vec[0].y
+                    right_y = horizontal_vec[1].y
+                else:
+                    left_y  = horizontal_vec[1].y
+                    right_y = horizontal_vec[0].y
+                # Base proximity: how close the wall is overall.
+                # (OpenCV: lower Y = higher on screen = further away)
+                avg_y     = (left_y + right_y) / 2.0
                 proximity = avg_y / float(message.image_height)
-                # Strictly positive → always turns left.
-                self.target_turn  = min(TURN_MAX, proximity * 1.2)
+                base_turn = min(TURN_MAX, proximity * 1.5)
+                # Steer toward the further side (lower Y = further).
+                if left_y < right_y:
+                    self.target_turn =  base_turn   # left side further → steer left
+                elif right_y < left_y:
+                    self.target_turn = -base_turn   # right side further → steer right
+                else:
+                    self.target_turn =  base_turn   # tie-breaker → default left
                 turn_magnitude    = abs(self.target_turn)
                 self.target_speed = BOUNDARY_SPEED_CAP * (1.0 - (turn_magnitude * 0.40))
                 return

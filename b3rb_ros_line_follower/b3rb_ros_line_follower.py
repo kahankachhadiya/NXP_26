@@ -480,20 +480,22 @@ class LineFollower(Node):
             x2 = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
             centroid_x = (x1 + x2) / 2.0
             norm_pos   = (centroid_x - half_width) / half_width
-            safe_limit = 1.0 - BOUNDARY_ZONE
 
-            if norm_pos > safe_limit:
-                error = norm_pos - safe_limit
-            elif norm_pos < -safe_limit:
-                error = norm_pos + safe_limit
+            # Widen the safe zone during avoidance to allow closer edge proximity.
+            avoidance_safe_limit = 1.0 - (BOUNDARY_ZONE * 0.5)
+            if norm_pos > avoidance_safe_limit:
+                error = norm_pos - avoidance_safe_limit
+            elif norm_pos < -avoidance_safe_limit:
+                error = norm_pos + avoidance_safe_limit
             else:
                 error = 0.0
-            error += avoid_bias
 
+            # APF decoupled from PID error — add directly to final output.
             derivative      = error - self.prev_error
             u               = self.kp * error + self.kd * derivative
             self.prev_error = error
-            self.target_turn  = max(TURN_MIN, min(TURN_MAX, -u))
+
+            self.target_turn  = max(TURN_MIN, min(TURN_MAX, avoid_bias - u))
             self.target_speed = AVOIDANCE_SPEED
             return
 
